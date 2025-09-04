@@ -14,6 +14,7 @@ from sunkit_spex.models.physical.io import (
     load_chianti_lines_lite,
     load_xray_abundances,
 )
+from sunkit_spex.spectrum.spectrum import SpectralAxis
 
 __all__ = ["ContinuumEmission", "LineEmission", "ThermalEmission"]
 
@@ -165,6 +166,8 @@ class ThermalEmission(FittableModel):
 
     def __init__(
         self,
+        spectral_axis,
+        energy_edges = None,
         temperature=u.Quantity(temperature.default, temperature.unit),
         emission_measure=u.Quantity(emission_measure.default, emission_measure.unit),
         mg=mg.default,
@@ -178,6 +181,13 @@ class ThermalEmission(FittableModel):
         **kwargs,
     ):
         self.abundance_type = abundance_type
+        self.spectral_axis = spectral_axis
+
+        if isinstance(spectral_axis,SpectralAxis):
+            self.energy_edges = spectral_axis.bin_edges
+        else:
+            self.spectral_axis = SpectralAxis(spectral_axis, bin_specification='centers')
+            self.energy_edges = self.spectral_axis.bin_edges
 
         if abundance_type != "sun_coronal_ext":
             abundances = DEFAULT_ABUNDANCES[abundance_type].data
@@ -191,6 +201,7 @@ class ThermalEmission(FittableModel):
             fe = 12 + np.log10(abundances[25])
 
         self.line = LineEmission(
+            spectral_axis=self.spectral_axis,
             temperature=temperature,
             emission_measure=emission_measure,
             mg=mg,
@@ -204,6 +215,7 @@ class ThermalEmission(FittableModel):
         )
 
         self.cont = ContinuumEmission(
+            spectral_axis=self.spectral_axis,
             temperature=temperature,
             emission_measure=emission_measure,
             mg=mg,
@@ -231,7 +243,7 @@ class ThermalEmission(FittableModel):
 
     def evaluate(
         self,
-        energy_edges,
+        spectral_axis_evaluate,
         temperature,
         emission_measure,
         mg,
@@ -242,8 +254,9 @@ class ThermalEmission(FittableModel):
         ca,
         fe,
     ):
+
         line_flux = self.line.evaluate(
-            energy_edges,
+            spectral_axis_evaluate,
             temperature,
             emission_measure,
             mg,
@@ -256,7 +269,7 @@ class ThermalEmission(FittableModel):
         )
 
         cont_flux = self.cont.evaluate(
-            energy_edges,
+            spectral_axis_evaluate,
             temperature,
             emission_measure,
             mg,
@@ -358,6 +371,8 @@ class ContinuumEmission(FittableModel):
 
     def __init__(
         self,
+        spectral_axis,
+        energy_edges = None,
         temperature=u.Quantity(temperature.default, temperature.unit),
         emission_measure=u.Quantity(emission_measure.default, emission_measure.unit),
         mg=mg.default,
@@ -371,6 +386,13 @@ class ContinuumEmission(FittableModel):
         **kwargs,
     ):
         self.abundance_type = abundance_type
+        self.spectral_axis = spectral_axis
+
+        if isinstance(spectral_axis,SpectralAxis):
+            self.energy_edges = spectral_axis.bin_edges
+        else:
+            self.spectral_axis = SpectralAxis(spectral_axis, bin_specification='centers')
+            self.energy_edges = self.spectral_axis.bin_edges
 
         if abundance_type != "sun_coronal_ext":
             abundances = DEFAULT_ABUNDANCES[abundance_type].data
@@ -398,7 +420,7 @@ class ContinuumEmission(FittableModel):
 
     def evaluate(
         self,
-        energy_edges,
+        spectral_axis_evaluate,
         temperature,
         emission_measure,
         mg,
@@ -409,10 +431,19 @@ class ContinuumEmission(FittableModel):
         ca,
         fe,
     ):
+        
+
+
         if hasattr(temperature, "unit"):
             temperature = temperature.to(u.K)
+            if not np.array_equal(spectral_axis_evaluate,self.spectral_axis):
+                raise ValueError('Must pass same spectral axis to evaluate as initialisation.')
+            energy_edges = self.energy_edges
         else:
             temperature = (temperature * u.MK).to_value(u.K)
+            if not np.array_equal(spectral_axis_evaluate,self.spectral_axis.value):
+                raise ValueError('Must pass same spectral axis to evaluate as initialisation.')
+            energy_edges = self.energy_edges.value
 
         flux = continuum_emission(
             energy_edges,
@@ -516,6 +547,8 @@ class LineEmission(FittableModel):
 
     def __init__(
         self,
+        spectral_axis,
+        energy_edges = None,
         temperature=u.Quantity(temperature.default, temperature.unit),
         emission_measure=u.Quantity(emission_measure.default, emission_measure.unit),
         mg=mg.default,
@@ -529,6 +562,14 @@ class LineEmission(FittableModel):
         **kwargs,
     ):
         self.abundance_type = abundance_type
+        self.abundance_type = abundance_type
+        self.spectral_axis = spectral_axis
+
+        if isinstance(spectral_axis,SpectralAxis):
+            self.energy_edges = spectral_axis.bin_edges
+        else:
+            self.spectral_axis = SpectralAxis(spectral_axis, bin_specification='centers')
+            self.energy_edges = self.spectral_axis.bin_edges
 
         if abundance_type != "sun_coronal_ext":
             abundances = DEFAULT_ABUNDANCES[abundance_type].data
@@ -556,7 +597,7 @@ class LineEmission(FittableModel):
 
     def evaluate(
         self,
-        energy_edges,
+        spectral_axis_evaluate,
         temperature,
         emission_measure,
         mg,
@@ -567,10 +608,18 @@ class LineEmission(FittableModel):
         ca,
         fe,
     ):
+        
         if hasattr(temperature, "unit"):
             temperature = temperature.to(u.K)
+            if not np.array_equal(spectral_axis_evaluate,self.spectral_axis):
+                raise ValueError('Must pass same spectral axis to evaluate as initialisation.')
+            energy_edges = self.energy_edges
         else:
             temperature = (temperature * u.MK).to_value(u.K)
+            if not np.array_equal(spectral_axis_evaluate,self.spectral_axis.value):
+                raise ValueError('Must pass same spectral axis to evaluate as initialisation.')
+            energy_edges = self.energy_edges.value
+
 
         flux = line_emission(
             energy_edges,
@@ -1289,6 +1338,50 @@ def _error_if_input_outside_valid_range(input_values, grid_range, param_name, pa
             f"All input {param_name} values must be within the range {grid_range[0]}--{grid_range[1]} {param_unit}. "
         )
         raise ValueError(message)
+
+
+
+# def _check_input_type(spectral_axis,initialised_spectral_axis):
+    
+#     if isinstance(spectral_axis, SpectralAxis):
+#         energy_edges = spectral_axis.bin_edges
+#     else:
+#         warnings.warn(
+#             "As a SpectralAxis object was not passed, bin edges will be calculated as averages from the centers given.",
+#             UserWarning,
+#         )
+#         spectral_axis = SpectralAxis(spectral_axis, bin_specification="centers")
+#         energy_edges = spectral_axis.bin_edges
+
+#     if isinstance(spectral_axis, u.Quantity):
+#         if not np.array_equal(spectral_axis, initialised_spectral_axis):
+#             message = (
+#                 f"Spectral Axis used for initialisation must be equal to that used in evaluation. "
+#             )
+#             raise ValueError(message)
+#         if isinstance(spectral_axis, SpectralAxis):
+#             energy_edges = spectral_axis.bin_edges
+#         else:
+#             warnings.warn(
+#                 "As a SpectralAxis object was not passed, bin edges will be calculated as averages from the centers given.",
+#                 UserWarning,
+#             )
+#             spectral_axis = SpectralAxis(spectral_axis, bin_specification="centers")
+#             energy_edges = spectral_axis.bin_edges
+
+#     if not isinstance(spectral_axis, u.Quantity):
+#         if not np.array_equal(spectral_axis, initialised_spectral_axis.value):
+#             message = (
+#                 f"Spectral Axis used for initialisation must be equal to that used in evaluation. "
+#             )
+#             raise ValueError(message)
+
+#         spectral_axis = SpectralAxis(spectral_axis*u.keV, bin_specification="centers")
+#         energy_edges = spectral_axis.bin_edges
+#         print(energy_edges)
+
+#     return energy_edges
+
 
 
 def _warn_if_input_outside_valid_range(input_values, grid_range, param_name, param_unit):
