@@ -12,6 +12,7 @@ class MatrixModel(Fittable1DModel):
     name = "SRM"
     conversion_factor = Parameter(fixed=True)
     _input_units_allow_dimensionless = True
+    verify_dims = False
 
     def __init__(self, matrix=None, 
                  model_spec_units=u.dimensionless_unscaled, 
