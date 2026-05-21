@@ -93,7 +93,7 @@ class ThickTarget(FittableModel):
         name="total_eflux", default=1.5, unit=u.electron * u.s**-1, description="Total electron flux", fixed=True
     )
 
-    verify_dims = False
+    verify_dims_in_fitting = False
 
     _input_units_allow_dimensionless = True
 
@@ -207,7 +207,7 @@ class ThinTarget(FittableModel):
     of ph s^-1 keV^-1.
     """
 
-    verify_dims = False
+    verify_dims_in_fitting = False
 
     n_inputs = 1
     n_outputs = 1

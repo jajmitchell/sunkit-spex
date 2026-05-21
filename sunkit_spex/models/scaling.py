@@ -57,7 +57,7 @@ class InverseSquareFluxScaling(FittableModel):
 
     n_inputs = 1
     n_outputs = 1
-    verify_dims = False
+    verify_dims_in_fitting = False
 
     observer_distance = Parameter(
         name="observer_distance",

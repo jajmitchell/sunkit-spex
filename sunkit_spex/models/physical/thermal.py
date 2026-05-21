@@ -127,7 +127,7 @@ class ThermalEmission(FittableModel):
 
     {doc_string_params}"""
 
-    verify_dims = False
+    verify_dims_in_fitting = False
 
     name = "ThermalEmission"
     n_inputs = 1
@@ -320,7 +320,7 @@ class ContinuumEmission(FittableModel):
 
     {doc_string_params}"""
 
-    verify_dims = False
+    verify_dims_in_fitting = False
 
     n_inputs = 1
     n_outputs = 1
@@ -462,7 +462,7 @@ class LineEmission(FittableModel):
 
     {doc_string_params}"""
 
-    verify_dims = False
+    verify_dims_in_fitting = False
 
     n_inputs = 1
     n_outputs = 1

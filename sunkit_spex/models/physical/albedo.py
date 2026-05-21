@@ -86,7 +86,7 @@ class Albedo(FittableModel):
 
     name = "Albedo"
     
-    verify_dims = False
+    verify_dims_in_fitting = False
 
     _input_units_allow_dimensionless = True
 
