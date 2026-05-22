@@ -1263,8 +1263,7 @@ def _error_if_input_outside_valid_range(input_values, grid_range, param_name, pa
 
 
 def _warn_if_input_outside_valid_range(input_values, grid_range, param_name, param_unit):
-    print(input_values)
-    print(grid_range)
+
     if input_values.min() < grid_range[0] or input_values.max() > grid_range[1]:
         message = (
             f"Some input {param_name} values outside valid range of "

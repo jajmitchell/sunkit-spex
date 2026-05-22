@@ -180,7 +180,7 @@ def plot(count_edges,photon_edges,observed_counts,observed_counts_err,model,save
         )
 
     
-    ax_dat.set_ylim(0.6*np.min(observed_counts.value/norm),2*np.max(observed_counts.value/norm))
+    ax_dat.set_ylim(0.6*np.min(observed_counts/norm),2*np.max(observed_counts/norm))
     ax_dat.legend(frameon=False,fontsize=14, ncol=2)
     ax_dat.loglog()
 
