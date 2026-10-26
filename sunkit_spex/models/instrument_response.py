@@ -2,156 +2,229 @@
 
 import numpy as np
 
-from astropy.modeling import Fittable1DModel, Parameter
 import astropy.units as u
+from astropy.modeling import Fittable1DModel, Parameter
+from astropy.units import Quantity
 
 __all__ = ["MatrixModel"]
 
+PHOTON_FLUX_UNIT = u.ph / (u.keV * u.s * u.cm**2)
+
 
 class MatrixModel(Fittable1DModel):
+    r"""
+    Fold a photon flux spectrum through a spectral response matrix into counts.
+
+    The model takes a photon flux, :math:`F_i` in ph keV\ :sup:`-1` s\ :sup:`-1`
+    cm\ :sup:`-2`, on photon energy bins :math:`i` and returns the counts in
+    each count energy bin :math:`j`:
+
+    .. math::
+
+        C_j = c \sum_i F_i \, \Delta E_i \, t \, A \, R_{ij}
+
+    where :math:`\Delta E_i` are the photon bin widths, :math:`t` the exposure
+    time, :math:`A` the area the response is normalised to, :math:`R_{ij}` the
+    response matrix in counts per photon and :math:`c` the ``conversion_factor``,
+    a dimensionless scaling of the response (1 by default, fixed).
+
+    A ``MatrixModel`` created without a ``matrix`` acts as a placeholder in a
+    compound model. `~sunkit_spex.fitting.fit_manager.FitManager` fills it in
+    from each spectrum's metadata, so one compound model can be fitted to
+    several spectra or instruments.
+
+    Units are checked whenever a value is set: any units equivalent to the
+    ones below are accepted and converted. Plain numbers are taken to be in
+    these units. When evaluated without units (as Astropy's unit-aware
+    fitters do internally) the input is taken to be in ph keV\ :sup:`-1`
+    s\ :sup:`-1` cm\ :sup:`-2` and the output is in counts.
+
+    The input is always a photon flux: evaluating needs ``photon_edges``,
+    ``area`` and ``exposure_time`` as well as the ``matrix``.
+
+    Parameters
+    ----------
+    matrix : array-like or `~astropy.units.Quantity`, optional
+        Response matrix with shape ``(n_photon_bins, n_count_bins)``, in counts
+        per photon: dimensionless or in units equivalent to ct/ph.
+    photon_edges : `~astropy.units.Quantity`, optional
+        Photon energy bin edges (keV), length ``n_photon_bins + 1``.
+    area : `~astropy.units.Quantity`, optional
+        Area the response is normalised to (cm\ :sup:`2`). A scalar, or one
+        value per photon bin for an energy-dependent effective area.
+    exposure_time : `~astropy.units.Quantity`, optional
+        Exposure (live) time (s).
+    conversion_factor : `float`, optional
+        Dimensionless scaling of the response, e.g. a calibration or
+        efficiency correction. Fixed by default.
+    **kwargs :
+        Passed to `~astropy.modeling.Fittable1DModel`.
+
+    Notes
+    -----
+    The output (count bins) generally differs in length from the input
+    (photon bins), so the model sets ``verify_dims_in_fitting = False``; this
+    lets Astropy fitters (Astropy 8.1+) fit compound models containing it.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import astropy.units as u
+    >>> from sunkit_spex.models.instrument_response import MatrixModel
+    >>> srm = MatrixModel(np.eye(3), photon_edges=[1, 2, 3, 5] * u.keV, area=2 * u.cm**2, exposure_time=10 * u.s)
+    >>> srm(np.ones(3) * u.ph / (u.keV * u.s * u.cm**2))  # doctest: +FLOAT_CMP
+    <Quantity [20., 20., 40.] ct>
+    """
+
     name = "SRM"
-    conversion_factor = Parameter(fixed=True)
-    _input_units_allow_dimensionless = True
+
+    # Dimensionless, so a unitless MatrixModel stays fully unitless; the
+    # counts-per-photon units belong to the matrix.
+    conversion_factor = Parameter(default=1, fixed=True, description="Dimensionless scaling of the response.")
+
+    # Photon bins in, count bins out: the shapes differ by design.
     verify_dims_in_fitting = False
+    _input_units_allow_dimensionless = True
 
-    def __init__(self, matrix=None, 
-                 model_spec_units=u.dimensionless_unscaled, 
-                 data_spec_units=u.dimensionless_unscaled, 
-                 conversion_factor=1*u.dimensionless_unscaled,
-                 spectrum_object= None,
-                 spectral_model=True):
-        
-        self.spectral_model = spectral_model
+    def __init__(
+        self,
+        matrix=None,
+        *,
+        photon_edges=None,
+        area=None,
+        exposure_time=None,
+        conversion_factor=1,
+        **kwargs,
+    ):
+        self.matrix = matrix
+        self.photon_edges = photon_edges
+        self.area = area
+        self.exposure_time = exposure_time
+        super().__init__(conversion_factor=conversion_factor, **kwargs)
 
-        if not self.spectral_model:
+    # ------------------------------------------------------------------ #
+    # Validated attributes
+    # ------------------------------------------------------------------ #
+    @property
+    def matrix(self):
+        """Response matrix in counts per photon (dimensionless), shape ``(n_photon_bins, n_count_bins)``."""
+        return self._matrix
 
-            self.model_spec_units = model_spec_units
-            self.data_spec_units = data_spec_units
-            self.matrix = matrix
-            conversion_factor = 1 << (data_spec_units / model_spec_units)
-        else:
-            # self.matrix = matrix
-            self.spectrum_object = spectrum_object
-            self.model_spec_units = model_spec_units
-
-            if spectrum_object:
-                self.data_spec_units = spectrum_object.unit
-                conversion_factor = 1* u.ct / u.ph
-                # conversion_factor = 1 << (self.data_spec_units / self.model_spec_units)
-                # print(conversion_factor)
+    @matrix.setter
+    def matrix(self, value):
+        if value is None:
+            self._matrix = None
+            return
+        if isinstance(value, Quantity):
+            if value.unit.is_equivalent(u.ct / u.ph):
+                value = value.to_value(u.ct / u.ph)
+            elif value.unit.is_equivalent(u.dimensionless_unscaled):
+                value = value.to_value(u.dimensionless_unscaled)
             else:
-                self.data_spec_units = data_spec_units
-                # conversion_factor = 1 << (data_spec_units / model_spec_units)
-                conversion_factor = 1* u.ct / u.ph
+                raise u.UnitsError(f"Response matrix must be in counts per photon, got {value.unit}.")
+        value = np.asarray(value, dtype=float)
+        if value.ndim != 2:
+            raise ValueError(f"Response matrix must be 2D (n_photon_bins, n_count_bins), got shape {value.shape}.")
+        self._matrix = value
+        self._check_photon_bins()
 
-        super().__init__(conversion_factor=conversion_factor)
+    @property
+    def photon_edges(self):
+        """Photon energy bin edges (keV)."""
+        return self._photon_edges
 
-    def evaluate(self, x, conversion_factor):
+    @photon_edges.setter
+    def photon_edges(self, value):
+        self._photon_edges = None if value is None else _as_unit(value, u.keV, "photon_edges")
+        self._check_photon_bins()
 
-        # matrix = self.matrix
+    @property
+    def area(self):
+        """Area the response is normalised to (cm2)."""
+        return self._area
 
-        if self.spectral_model:
+    @area.setter
+    def area(self, value):
+        self._area = None if value is None else _as_unit(value, u.cm**2, "area")
 
-            matrix = self.spectrum_object.meta['srm']
-            input_axis = np.array(self.spectrum_object.spectral_axis.bin_edges)
-            input_widths = np.diff(input_axis)
-            output_widths = np.diff(self.spectrum_object.meta['ph_axis'])
+    @property
+    def exposure_time(self):
+        """Exposure time (s)."""
+        return self._exposure_time
 
-            # print('IR SRM = ',self.spectrum_object.meta['srm'].shape)
-            # print('IR SRM = ',self.spectrum_object.spectral_axis.bin_edges.shape)
+    @exposure_time.setter
+    def exposure_time(self, value):
+        self._exposure_time = None if value is None else _as_unit(value, u.s, "exposure_time")
 
-            geo_area = self.spectrum_object.meta['geo_area'] 
-            exposure_time = self.spectrum_object.meta['exposure_time'] 
-            norm = input_widths * exposure_time * geo_area
+    @property
+    def is_placeholder(self):
+        """`True` if no response matrix has been set yet."""
+        return self._matrix is None
 
-            # print('input_widths = ',input_widths)
-            # print('exposure_time = ',exposure_time)
-            # print('geo_area = ',geo_area)
+    @property
+    def n_photon_bins(self):
+        """Number of photon (input) bins of the matrix."""
+        return None if self.is_placeholder else self._matrix.shape[0]
 
-            # print(x.unit)
-            # print(conversion_factor.unit)
-            # print(norm.unit)
+    @property
+    def n_count_bins(self):
+        """Number of count (output) bins of the matrix."""
+        return None if self.is_placeholder else self._matrix.shape[1]
 
-            # flux =  (x @ matrix) * conversion_factor * norm
-            flux =  (((x*output_widths*exposure_time)@ (matrix*geo_area*u.cm**2)) * conversion_factor ) 
+    def _check_photon_bins(self):
+        matrix = getattr(self, "_matrix", None)
+        edges = getattr(self, "_photon_edges", None)
+        if matrix is not None and edges is not None and edges.size - 1 != matrix.shape[0]:
+            raise ValueError(
+                f"photon_edges give {edges.size - 1} photon bins but the response matrix has {matrix.shape[0]}."
+            )
 
-        else:
-            flux =  x  @ matrix * conversion_factor * (geo_area*u.cm**2)
+    # ------------------------------------------------------------------ #
+    # Evaluation
+    # ------------------------------------------------------------------ #
+    def evaluate(self, flux, conversion_factor):
+        if self.is_placeholder:
+            raise ValueError(
+                "MatrixModel has no response matrix; set one or let FitManager fill it in from the spectrum."
+            )
 
-        # print('HHEERRREEEE')
+        missing = [name for name in ("photon_edges", "area", "exposure_time") if getattr(self, name) is None]
+        if missing:
+            raise ValueError(
+                f"MatrixModel needs {', '.join(missing)} to fold a photon flux into counts; set them or let "
+                "FitManager fill them in from the spectrum."
+            )
 
-        if hasattr(conversion_factor,"unit"):
-            return flux
-        else:
-            return flux.value
+        photons_per_flux = np.diff(self._photon_edges) * self._exposure_time * self._area  # keV s cm2
 
-    def set_spectrum_object(self, new_spectrum_object):
-        self.spectrum_object = new_spectrum_object
-    
-    # @property
-    # def model_spec_units(self):
-    #     return self._model_spec_units
+        if isinstance(flux, Quantity) and flux.unit != u.dimensionless_unscaled:
+            photons = (flux * photons_per_flux).to_value(u.ph)  # raises unless flux is a photon flux
+            # The matrix is in counts per photon.
+            return (photons @ self._matrix) * conversion_factor * u.ct
 
-    # @model_spec_units.setter
-    # def model_spec_units(self, new_unit):
-    #     self._model_spec_units = new_unit
-
-    #     if hasattr(self,"data_spec_units"):
-
-    #         if self.data_spec_units != u.dimensionless_unscaled:
-
-    #             new_param_unit = self.data_spec_units / new_unit
-
-    #             self.conversion_factor = self.conversion_factor.value * new_param_unit
-
-    #         else:
-                
-    #             self.conversion_factor = self.conversion_factor * u.dimensionless_unscaled
-
-
-    # @property
-    # def data_spec_units(self):
-    #     return self._data_spec_units
-
-    # @data_spec_units.setter
-    # def data_spec_units(self, new_unit):
-    #     self._data_spec_units = new_unit
-
-    #     if hasattr(self,"model_spec_units"):
-
-
-    #         if self.data_spec_units != u.dimensionless_unscaled:
-
-    #             new_param_unit =  new_unit / self.model_spec_units 
-
-    #             self.conversion_factor = self.conversion_factor.value * new_param_unit
-
-    #         else:
-                
-    #             self.conversion_factor = self.conversion_factor * u.dimensionless_unscaled
+        # Units stripped: plain numbers (as Astropy fitters pass) or dimensionless (as the
+        # JointFitter passes for a model without units). Still a photon flux, in
+        # ph / (keV s cm2); the output is in ct.
+        photons = getattr(flux, "value", flux) * photons_per_flux.to_value(u.keV * u.s * u.cm**2)
+        return (photons @ self._matrix) * getattr(conversion_factor, "value", conversion_factor)
 
     @property
     def input_units(self):
-        # return {"x": self.model_spec_units }SS
-        return {"x": u.ph * u.keV**-1 * u.s**-1 * u.cm**-2 }
+        return {self.inputs[0]: PHOTON_FLUX_UNIT}
 
     @property
     def return_units(self):
-        # return {"y": self.data_spec_units}
-        return {"y": u.ct}
+        return {self.outputs[0]: u.ct}
 
     def _parameter_units_for_data_units(self, inputs_unit, outputs_unit):
-        return {"conversion_factor": self.conversion_factor.unit}
+        # conversion_factor is dimensionless whatever the data units.
+        return {}
 
-    # @property
-    # def input_units(self):
-    #     # return {"x": self.model_spec_units }SS
-    #     return {"x": u.ph * u.keV**-1 * u.s**-1 * u.cm**-2 }
 
-    # @property
-    # def return_units(self):
-    #     # return {"y": self.data_spec_units}
-    #     return {"y": u.ct* u.keV**-1 * u.s**-1}
-
-    # def _parameter_units_for_data_units(self, inputs_unit, outputs_unit):
-    #     return {"conversion_factor": self.conversion_factor.unit}
+def _as_unit(value, unit, name):
+    """``value`` as a Quantity in ``unit``; plain numbers are taken to be in ``unit``."""
+    if not isinstance(value, Quantity):
+        return Quantity(value, unit)
+    if not value.unit.is_equivalent(unit):
+        raise u.UnitsError(f"{name} must be in units equivalent to {unit}, got {value.unit}.")
+    return value.to(unit)
