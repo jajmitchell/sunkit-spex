@@ -1,8 +1,7 @@
 [build-system]
 requires = [
   "setuptools>=62.1",
-  "setuptools_scm[toml]>=8.0.0",
-  "wheel",
+  "setuptools_scm[toml]>=8.0.1",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -16,23 +15,38 @@ authors = [
   { name = "The SunPy Community", email = "sunpy@googlegroups.com" },
 ]
 dependencies = [
-    "corner>=2.2",
-    "emcee>=3.1",
     "matplotlib>=3.9",
-    "nestle>=0.2",
-    "numdifftools>=0.9.42",
     "numpy>=1.26",  # Note: keeping support for numpy 1.x for now
     "parfive>=2.1",
-    "scipy>=1.12",
+    "scipy>=1.14.1",
     "sunpy>=7.0",
     "xarray>=2023.12",
-    "gwcs>=0.21.0",
+    "gwcs>=0.26.0",
     "ndcube>=2.3",
 ]
 
 dynamic = ["version"]
+keywords = ["solar physics", "solar", "science", "sun", "x-ray", "gamma-ray", "spectra"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Physics",
+]
 
 [project.optional-dependencies]
+legacy = [
+    "corner>=2.2",
+    "emcee>=3.1",
+    "nestle>=0.2",
+    "numdifftools>=0.9.42",
+]
 tests = [
   "pytest",
   "pytest-doctestplus",
@@ -47,16 +61,20 @@ docs = [
   "packaging",
   "sphinx-changelog",
   "sphinx-gallery",
-  "pypandoc"
+  "joblib", # for sphinx-gallery parallel
 ]
 dev = [
-    "sunkit-spex[docs,tests]",
+    "sunkit-spex[legacy,docs,tests]",
     "tox"
 ]
 
 [project.urls]
 Homepage = "https://sunkit-spex.readthedocs.io"
+"Source Code" = "https://github.com/sunpy/sunkit-spex"
 Download = "https://pypi.org/project/sunkit-spex"
+Documentation = "https://sunkit-spex.readthedocs.io"
+Changelog = "https://sunkit-spex.readthedocs.io/en/latest/whatsnew/changelog.html"
+"Issue Tracker" = "https://github.com/sunpy/sunkit-spex/issues"
 
 [tool.setuptools]
 zip-safe = false
@@ -84,6 +102,19 @@ version_file = "sunkit_spex/_version.py"
   type_incorrect_long = "The changelog file you added is not one of the allowed types. Please use one of the types described in the changelog [README](https://github.com/sunpy/sunkit-spex/blob/main/changelog/README.rst)"
 
   number_incorrect_long = "The number in the changelog file you added does not match the number of this pull request. Please rename the file."
+
+[tool.repo-review.ignore]
+PY003 = "The LICENSE file is in licenses/"
+PY005 = "The template packages tests inside sunkit_spex/"
+PP006 = "We are not currently using dependency-groups"
+PP301 = "pytest config is in pytest.ini"
+PC110 = "ruff format not currently an option"
+PC140 = "No SunPy projects make heavy use of types"
+PC170 = "Not using pygrep"
+PC180 = "No markdown formatter required"
+PC901 = "Opt-out"
+PC902 = "Opt-out"
+MY = "No SunPy projects make heavy use of types"
 
 # TODO: This should be in towncrier.toml but Giles currently only works looks in
 # pyproject.toml we should move this back when it's fixed.

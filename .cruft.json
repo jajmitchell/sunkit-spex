@@ -1,6 +1,6 @@
 {
   "template": "https://github.com/sunpy/package-template",
-  "commit": "164646d882aa2e972d305c54778aaaf35f707464",
+  "commit": "a9fbb6eca5e0a91e7b063690e207905919b94724",
   "checkout": null,
   "context": {
     "cookiecutter": {
@@ -10,29 +10,33 @@
       "author_name": "The SunPy Community",
       "author_email": "sunpy@googlegroups.com",
       "project_url": "https://sunkit-spex.readthedocs.io",
-      "github_repo": "",
-      "sourcecode_url": "",
+      "github_repo": "sunpy/sunkit-spex",
+      "sourcecode_url": "https://github.com/sunpy/sunkit-spex",
       "download_url": "https://pypi.org/project/sunkit-spex",
-      "documentation_url": "",
-      "changelog_url": "",
-      "issue_tracker_url": "",
+      "documentation_url": "https://sunkit-spex.readthedocs.io/en/latest/",
+      "changelog_url": "https://sunkit-spex.readthedocs.io/en/latest/whatsnew/changelog.html",
+      "issue_tracker_url": "https://github.com/sunpy/sunkit-spex/issues",
       "license": "BSD 3-Clause",
       "minimum_python_version": "3.12",
       "use_compiled_extensions": "n",
       "enable_dynamic_dev_versions": "y",
       "include_example_code": "n",
-      "include_cruft_update_github_workflow": "y",
+      "include_cruft_update_github_workflow": "n",
+      "use_pat_in_cruft_update_workflow": "y",
       "use_extended_ruff_linting": "y",
+      "matrix_room_id": "",
+      "extra_ci_jobs": "",
+      "use_sunpy_pr_template": "y",
       "_sphinx_theme": "sunpy",
       "_parent_project": "",
       "_install_requires": "",
       "_copy_without_render": [
         "docs/_templates",
         "docs/_static",
-        ".github/workflows/sub_package_update.yml"
+        ".github/workflows/zizmor.yml"
       ],
       "_template": "https://github.com/sunpy/package-template",
-      "_commit": "164646d882aa2e972d305c54778aaaf35f707464"
+      "_commit": "a9fbb6eca5e0a91e7b063690e207905919b94724"
     }
   },
   "directory": null

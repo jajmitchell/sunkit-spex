@@ -1,37 +1,54 @@
-import numpy as np
-from scipy.integrate._quadrature import _cached_roots_legendre
+from functools import lru_cache
 
-__all__ = ["fixed_quad", "gauss_legendre"]
+import numpy as np
+from scipy.special import roots_legendre
+
+__all__ = ["fixed_quad_batch", "gauss_legendre"]
+
+
+@lru_cache
+def _cached_roots_legendre(n):
+    """
+    Cache the Gauss-Legendre nodes and weights for a given order.
+
+    `scipy.special.roots_legendre` is not itself cached, and this function is called on every
+    call to `gauss_legendre`/`fixed_quad`, so this avoids recomputing the same nodes and weights
+    repeatedly during the doubling-order integration in
+    `~sunkit_spex.models.physical.nonthermal._integrate_part`.
+    """
+    return roots_legendre(n)
 
 
 def _legendre_roots(a, b, n=5):
     """
-    Calculate the positions and weights for a Gauss-Legendre integration scheme with limits [a, b].
+    Map the standard Gauss-Legendre nodes and weights on [-1, 1] to each of the given intervals.
 
     Parameters
     ----------
     a : `numpy.array`
-        Lower integration limits
+        Lower integration limits, one per interval to integrate
     b : `numpy.array`
-        Upper integration limits
+        Upper integration limits, one per interval to integrate
     n : `int`, optional
-        Order of quadrature integration. Default is 5.
+        Order of quadrature integration (number of nodes per interval). Default is 5.
 
     Returns
     -------
     `tuple` :
-        (x, w) The positions and weights for the integration.
+        (nodes, weights), each of shape ``(len(a), n)``: for each interval `a[i]` to `b[i]`, the
+        `n` quadrature node positions and their corresponding weights.
 
     """
-    # Legendre points and weights over interval [-1, 1]
-    x, w = _cached_roots_legendre(n)
+    # Nodes and weights of the standard n-point Gauss-Legendre rule on [-1, 1].
+    standard_nodes, standard_weights = _cached_roots_legendre(n)
 
-    # map x, w to interval [a, b]
-    xm = 0.5 * (b + a)
-    xl = 0.5 * (b - a)
-    xab = xm.reshape(a.shape[0], 1) + xl.reshape(a.shape[0], 1) * x.reshape(1, x.shape[0])
-    wab = w.reshape(1, w.shape[0]) * xl.reshape(a.shape[0], 1)
-    return xab, wab
+    # Map each interval's nodes/weights from [-1, 1] to [a, b] via the standard substitution
+    # node = midpoint + half_width * standard_node, weight = half_width * standard_weight.
+    midpoint = (0.5 * (a + b))[:, np.newaxis]
+    half_width = (0.5 * (b - a))[:, np.newaxis]
+    nodes = midpoint + half_width * standard_nodes[np.newaxis, :]
+    weights = half_width * standard_weights[np.newaxis, :]
+    return nodes, weights
 
 
 def gauss_legendre(func, a, b, n=5, args=(), func_kwargs={}):
@@ -47,9 +64,9 @@ def gauss_legendre(func, a, b, n=5, args=(), func_kwargs={}):
         If integrating a vector-valued function, the returned array must have
         shape ``(..., len(x))``.
     a : float
-        Lower limit of integration.
+        Lower limits of integration.
     b : float
-        Upper limit of integration.
+        Upper limits of integration.
     n : int, optional
         Order of quadrature integration. Default is 5.
     args : tuple, optional
@@ -87,14 +104,11 @@ def gauss_legendre(func, a, b, n=5, args=(), func_kwargs={}):
     """
     a = np.atleast_1d(a)
     b = np.atleast_1d(b)
-    (
-        xi,
-        wi,
-    ) = _legendre_roots(a, b, n)
-    return np.sum(wi * func(xi, *args, **func_kwargs), axis=1)
+    nodes, weights = _legendre_roots(a, b, n)
+    return np.sum(weights * func(nodes, *args, **func_kwargs), axis=1)
 
 
-def fixed_quad(func, a, b, n=5, args=(), func_kwargs={}):
+def fixed_quad_batch(func, a, b, n=5, args=(), func_kwargs={}):
     """
     Compute a definite integral using fixed-order Gaussian quadrature.
 
@@ -110,9 +124,9 @@ def fixed_quad(func, a, b, n=5, args=(), func_kwargs={}):
         If integrating a vector-valued function, the returned array must have
         shape ``(..., len(x))``.
     a : float or `np.array`
-        Lower limit of integration.
+        Lower limits of integration.
     b : float or `np.array`
-        Upper limit of integration.
+        Upper limits of integration.
     n : int, optional
         Order of quadrature integration. Default is 5.
     args : tuple, optional
@@ -127,23 +141,23 @@ def fixed_quad(func, a, b, n=5, args=(), func_kwargs={}):
 
     Examples
     --------
-    >>> from sunkit_spex.legacy.integrate  import fixed_quad
+    >>> from sunkit_spex.legacy.integrate  import fixed_quad_batch
     >>> f = lambda x: x**8
-    >>> fixed_quad(f,0.0,1.0,n=4)
+    >>> fixed_quad_batch(f,0.0,1.0,n=4)
     array(0.11108844)
-    >>> fixed_quad(f,0.0,1.0,n=5)
+    >>> fixed_quad_batch(f,0.0,1.0,n=5)
     array(0.11111111)
     >>> print(1/9.0)  # analytical result
     0.1111111111111111
 
-    >>> fixed_quad(f, [0, 1, 2], [1, 2, 3], n=5)
+    >>> fixed_quad_batch(f,[0, 1, 2],[1, 2, 3],n=5)
     array([1.11111111e-01, 5.67777778e+01, 2.13011111e+03])
     >>> 1/9, (2**9 - 1**9)/9, (3**9 - 2**9)/9 # analytical result
     (0.1111111111111111, 56.77777777777778, 2130.1111111111113)
 
-    >>> fixed_quad(np.cos,0.0,np.pi/2,n=4)
+    >>> fixed_quad_batch(np.cos,0.0,np.pi/2,n=4)
     array(0.99999998)
-    >>> fixed_quad(np.cos,0.0,np.pi/2,n=5)
+    >>> fixed_quad_batch(np.cos,0.0,np.pi/2,n=5)
      array(1.)
     >>> float(np.sin(np.pi/2)-np.sin(0))  # analytical result
     1.0

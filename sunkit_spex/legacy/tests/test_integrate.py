@@ -1,7 +1,7 @@
 import numpy as np
 from numpy.testing import assert_allclose
 
-from sunkit_spex.legacy.integrate import fixed_quad, gauss_legendre
+from sunkit_spex.legacy.integrate import fixed_quad_batch, gauss_legendre
 
 
 def test_scalar():
@@ -11,7 +11,7 @@ def test_scalar():
         return x ** (2 * n - 1)
 
     expected = 1 / (2 * n)
-    got_fq = fixed_quad(func, 0, 1, n=n)
+    got_fq = fixed_quad_batch(func, 0, 1, n=n)
     got_gl = gauss_legendre(func, 0, 1, n=n)
     # quadrature exact for this input
     assert_allclose(got_fq, expected, rtol=1e-12)
@@ -26,7 +26,7 @@ def test_vector_x():
         return x ** p[:, None]
 
     expected = 1 / (p + 1)
-    got_fq = fixed_quad(func, 0, 1, n=n)
+    got_fq = fixed_quad_batch(func, 0, 1, n=n)
     got_gl = gauss_legendre(func, 0, 1, n=n)
     assert_allclose(got_fq, expected, rtol=1e-12)
     assert_allclose(got_gl, expected, rtol=1e-12)
@@ -41,7 +41,7 @@ def test_vector_lims():
     a = [0, 1, 2]
     b = [1, 2, 3]
     expected = 1 / 9, (2**9 - 1) / 9, (3**9 - 2**9) / 9
-    got_fq = fixed_quad(func, a, b, n=n)
+    got_fq = fixed_quad_batch(func, a, b, n=n)
     got_gl = gauss_legendre(func, a, b, n=n)
     assert_allclose(got_fq, expected, rtol=1e-12)
     assert_allclose(got_gl, expected, rtol=1e-12)
