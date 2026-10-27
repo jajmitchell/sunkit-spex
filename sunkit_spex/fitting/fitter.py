@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 import astropy.units as u
-from astropy.modeling import CompoundModel, Model, fitting
+from astropy.modeling import CompoundModel, Model, Parameter, fitting
 from astropy.nddata import StdDevUncertainty
 
 from sunkit_spex.fitting.fitters import JointFitter, ScipyMinimizeJointFitter
@@ -274,6 +274,21 @@ class FitManager:
         return self.fitted_models[0]
 
     @property
+    def covariance(self):
+        """
+        Covariance of the free parameters of all the fitted models together,
+        when FitManager estimated it (see `~FitManager.fit`), else `None`.
+
+        `tuple` (``parameters``, ``matrix``): ``parameters`` lists
+        ``(spectrum index, parameter name)`` for each row of ``matrix``. Each
+        fitted model also gets its own block, as Astropy fitters give it, in
+        ``model.cov_matrix`` and ``model.stds``.
+        """
+        if self._fitted_models is None:
+            raise RuntimeError("No fitted models available, call fit() first.")
+        return self._covariance
+
+    @property
     def fit_info(self):
         """Fit information recorded by the fitter."""
         return getattr(self._fitter, "fit_info", None)
@@ -299,6 +314,18 @@ class FitManager:
         -------
         `~astropy.modeling.Model` or `list` [`~astropy.modeling.Model`]
             The fitted model, or list of fitted models when fitting jointly.
+
+        Notes
+        -----
+        When the fitter gives no parameter uncertainties (the joint fitters,
+        or an Astropy fitter without ``calc_uncertainties``), they are
+        estimated from the Jacobian of the residuals ``(data - model) / sigma``
+        over all the spectra at the fitted values, as Astropy's least-squares
+        fitters do: the covariance is ``inv(J.T @ J)``, scaled by the reduced
+        chi-squared if the spectra have no uncertainties. Shared (tied)
+        parameters are counted once, so their uncertainties use every spectrum.
+        They are stored on each fitted model (``cov_matrix``, ``stds``) and in
+        `~FitManager.covariance`.
         """
         prepared = self._get_prepared()
         sigmas = [_stddev(spectrum) for _, spectrum in prepared]
@@ -323,6 +350,12 @@ class FitManager:
             fitted = [self._fitter(model, self._model_x(model, spectrum), _data(spectrum), **kwargs)]
 
         self._fitted_models = list(fitted)
+        self._covariance = None
+        if any(getattr(model, "stds", None) is None for model in fitted):
+            # The joint fitters (and some Astropy fitters) give no uncertainties: estimate them.
+            xs = [self._model_x(model, spectrum) for model, spectrum in prepared]
+            ys = [_data(spectrum) for _, spectrum in prepared]
+            self._covariance = _add_uncertainties(self._fitted_models, xs, ys, sigmas, self._uses_joint_fitter)
         return self._fitted_models if self.is_joint else self._fitted_models[0]
 
     def evaluate(self, fitted=True):
@@ -343,12 +376,29 @@ class FitManager:
         models = self.fitted_models if fitted else [model for model, _ in prepared]
         return [model(self._model_x(model, spectrum)) for model, (_, spectrum) in zip(models, prepared)]
 
+    def plot(self, **kwargs):
+        """
+        Plot the spectra, fitted model components and residuals.
+
+        Keywords are passed to `sunkit_spex.visualisation.plotter.plot_fit`,
+        e.g. ``layout="combined"`` or ``y="counts"``.
+
+        Returns
+        -------
+        fig : `~matplotlib.figure.Figure`
+        axes : `numpy.ndarray` [`~matplotlib.axes.Axes`]
+        """
+        from sunkit_spex.visualisation.plotter import plot_fit  # noqa: PLC0415
+
+        return plot_fit(self, **kwargs)
+
     # ------------------------------------------------------------------ #
     # Preparation
     # ------------------------------------------------------------------ #
     def _reset(self):
         self._prepared = None
         self._fitted_models = None
+        self._covariance = None
 
     def _get_prepared(self):
         """``(model, spectrum)`` per spectrum, ready to fit; built on first use."""
@@ -411,6 +461,11 @@ class FitManager:
             elif isinstance(leaf, Albedo):
                 leaf.energy_edges = self._photon_edges(spectrum, required_for="the albedo correction")
                 angle = self._meta(spectrum, "albedo_angle")
+                if angle is not None and not np.all(np.isfinite(angle)):
+                    raise ValueError(
+                        f"Spectrum meta {self._meta_keys['albedo_angle']!r} (albedo angle) is {angle}; give the "
+                        "angle between -90 and 90 degrees, or leave it out to fit or fix theta in the model."
+                    )
                 if angle is not None:
                     leaf.theta = angle
                     leaf.theta.fixed = True
@@ -574,6 +629,88 @@ def _stddev(spectrum):
     if kind == "ivar":
         return 1 / np.sqrt(u.Quantity(uncertainty.array, unit))
     raise TypeError(f"Unsupported uncertainty type {kind!r}.")
+
+
+def _add_uncertainties(models, xs, ys, sigmas, ties_take_list):
+    """
+    Estimate the covariance of the free parameters of ``models`` (fitted to
+    ``ys`` at ``xs``) together, and give each model its ``cov_matrix`` and
+    ``stds``. Returns ``(parameters, matrix)``, or `None` if it can't be
+    estimated.
+    """
+    free = [(i, name) for i, m in enumerate(models) for name in m.param_names if not m.fixed[name] and not m.tied[name]]
+    if not free:
+        return None
+    work = [copy.deepcopy(model) for model in models]
+    params = [getattr(work[i], name) for i, name in free]
+    weighted = all(sigma is not None for sigma in sigmas)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # bad bins were warned about when fitting
+        scales = [_weights(sigma, power=1).to_value(1 / y.unit) if weighted else 1 for sigma, y in zip(sigmas, ys)]
+
+    def residuals(values):
+        for param, value in zip(params, values):
+            param.value = value
+        _apply_ties(work, ties_take_list)
+        return np.concatenate(
+            [
+                (y.value - u.Quantity(model(x)).to_value(y.unit)) * scale
+                for model, x, y, scale in zip(work, xs, ys, scales)
+            ]
+        )
+
+    best = np.array([param.value for param in params], dtype=float)
+    jacobian = np.empty((residuals(best).size, best.size))
+    for k, (param, value) in enumerate(zip(params, best)):
+        # Central differences, one-sided next to a bound.
+        step = 1e-5 * abs(value) if value else 1e-8
+        low, high = param.bounds
+        up = value + step if high is None or value + step <= high else value
+        down = value - step if low is None or value - step >= low else value
+        shifted_up, shifted_down = best.copy(), best.copy()
+        shifted_up[k], shifted_down[k] = up, down
+        jacobian[:, k] = (residuals(shifted_up) - residuals(shifted_down)) / (up - down)
+    residual = residuals(best)
+
+    try:
+        matrix = np.linalg.inv(jacobian.T @ jacobian)
+    except np.linalg.LinAlgError:
+        warnings.warn(
+            "The parameter uncertainties could not be estimated: some parameters have no effect on the model.",
+            skip_file_prefixes=_WARN_SKIP,
+        )
+        return None
+    if not weighted:
+        # No measurement uncertainties: scale by the scatter about the fit, as scipy's curve_fit does.
+        dof = residual.size - best.size
+        if dof > 0:
+            matrix = matrix * np.sum(residual**2) / dof
+
+    for i, model in enumerate(models):
+        rows = [k for k, (index, _) in enumerate(free) if index == i]
+        if rows:
+            names = [free[k][1] for k in rows]
+            block = matrix[np.ix_(rows, rows)]
+            model.cov_matrix = fitting.Covariance(block, names)
+            model.stds = fitting.StandardDeviations(block, names)
+    return free, matrix
+
+
+def _apply_ties(models, ties_take_list):
+    """Set tied parameters from what they are tied to; twice, as ties may depend on other ties."""
+    for _ in range(2):
+        for model in models:
+            for name in model.param_names:
+                tie = model.tied[name]
+                if not tie:
+                    continue
+                value = tie(models if ties_take_list else model)
+                param = getattr(model, name)
+                if isinstance(value, Parameter):
+                    value = value.value if value.unit is None else value.quantity
+                if isinstance(value, u.Quantity):
+                    value = value.value if param.unit is None else value.to_value(param.unit)
+                param.value = value
 
 
 def _weights(stddev, power):

@@ -165,7 +165,10 @@ class ThickTarget(FittableModel):
         )
         output[~np.isfinite(output)] = 0
 
-        return output * (total_eflux << (u.electron / u.s)).value * THICK_TARGET_EFLUX_SCALE
+        flux = output * (total_eflux << (u.electron / u.s)).value * THICK_TARGET_EFLUX_SCALE
+        # Return a Quantity when evaluated with units, so the flux can be combined with
+        # other models (e.g. a thermal component) that keep theirs.
+        return flux << self.return_units[self.outputs[0]] if hasattr(energy_edges, "unit") else flux
 
     @property
     def input_units(self):
@@ -288,7 +291,10 @@ class ThinTarget(FittableModel):
         )
         output[~np.isfinite(output)] = 0
 
-        return output * (total_eflux << (u.s**-1 * u.cm**-2)).value * THIN_TARGET_EFLUX_SCALE
+        flux = output * (total_eflux << (u.s**-1 * u.cm**-2)).value * THIN_TARGET_EFLUX_SCALE
+        # Return a Quantity when evaluated with units, so the flux can be combined with
+        # other models (e.g. a thermal component) that keep theirs.
+        return flux << self.return_units[self.outputs[0]] if hasattr(energy_edges, "unit") else flux
 
     @property
     def input_units(self):
