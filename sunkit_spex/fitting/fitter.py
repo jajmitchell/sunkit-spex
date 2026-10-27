@@ -21,7 +21,7 @@ import astropy.units as u
 from astropy.modeling import CompoundModel, Model, Parameter, fitting
 from astropy.nddata import StdDevUncertainty
 
-from sunkit_spex.fitting.fitters import JointFitter, ScipyMinimizeJointFitter
+from sunkit_spex.fitting.fitters import JointFitter, LeastSquaresJointFitter, ScipyMinimizeJointFitter 
 from sunkit_spex.models.instrument_response import MatrixModel
 from sunkit_spex.models.physical.albedo import Albedo
 from sunkit_spex.models.scaling import InverseSquareFluxScaling
@@ -218,7 +218,7 @@ class FitManager:
 
     def _default_fitter(self):
         if self.is_joint:
-            return ScipyMinimizeJointFitter()
+            return LeastSquaresJointFitter()
         return fitting.TRFLSQFitter(calc_uncertainties=True)
 
     @property

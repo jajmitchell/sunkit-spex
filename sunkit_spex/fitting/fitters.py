@@ -1,4 +1,8 @@
 import numpy as np
+import warnings
+
+import numpy as np
+from scipy.optimize import least_squares
 
 from astropy import units as u
 from astropy.modeling.fitting import Fitter, _validate_model, model_to_fit_params
@@ -6,7 +10,7 @@ from astropy.modeling.fitting import Fitter, _validate_model, model_to_fit_param
 from sunkit_spex.fitting.metrics import statistics
 from sunkit_spex.fitting.optimizers import minimizers
 
-__all__ = ["JointFitter", "ScipyMinimizeJointFitter"]
+__all__ = ["JointFitter", "LeastSquaresJointFitter", "ScipyMinimizeJointFitter"]
 
 
 DEFAULT_FIT_STATISTIC = statistics.chi_squared
@@ -508,3 +512,85 @@ class ScipyMinimizeJointFitter(JointFitter):
         model_outputs = self._evaluate_models(models, xs, parameter_units=parameter_units)
 
         return self._stat_method(ys, model_outputs, data_y_weights=weights, **fkwarg)
+    
+class LeastSquaresJointFitter(JointFitter):
+    r"""
+    Joint fitter minimising the chi-squared with a trust region least-squares method.
+
+    It minimises the same chi-squared as `ScipyMinimizeJointFitter` with its
+    default statistic, with weights 1/sigma**2, and handles fixed and tied
+    parameters (including ties between models) and bounds in the same way.
+    It uses `scipy.optimize.least_squares` (trust region reflective, as
+    Astropy's ``TRFLSQFitter`` does for one model), which needs a small
+    fraction of the model evaluations Nelder-Mead does.
+
+    Use `ScipyMinimizeJointFitter` to fit with another statistic (e.g. Cash).
+    """
+
+    def __init__(self):
+        super().__init__(optimizer=least_squares, statistic=DEFAULT_FIT_STATISTIC)
+
+    def run_fitter(self, models, farg, fkwarg=None, optkwarg=None):
+        """
+        Fit the models to the data. ``fkwarg`` takes ``{"weights": [w_1, ...]}``
+        (1/sigma**2 per model); ``optkwarg`` is passed to
+        `scipy.optimize.least_squares` (e.g. ``max_nfev``), by default with
+        ``method="trf"`` and ``x_scale="jac"``.
+        """
+        fkwarg = {} if fkwarg is None else dict(fkwarg)
+        weights = fkwarg.pop("weights", None)
+        if fkwarg:
+            raise TypeError(f"Unsupported fkwarg for a least-squares fit: {', '.join(fkwarg)}.")
+        optkwarg = {} if optkwarg is None else dict(optkwarg)
+        # Settings meant for scipy.optimize.minimize (Nelder-Mead) have no meaning here.
+        ignored = [key for key in ("options", "tol") if key in optkwarg]
+        if optkwarg.get("method") not in (None, "trf", "dogbox", "lm"):
+            ignored.append("method")
+        if ignored:
+            warnings.warn(
+                f"Ignoring {', '.join(ignored)} (options for scipy.optimize.minimize): the least-squares joint "
+                "fitter takes scipy.optimize.least_squares keywords, e.g. max_nfev. Pass "
+                "fitter=ScipyMinimizeJointFitter() to fit with scipy.optimize.minimize.",
+                stacklevel=4,
+            )
+            for key in ignored:
+                optkwarg.pop(key)
+        optkwarg = {"method": "trf", "x_scale": "jac"} | optkwarg
+
+        xs, ys = farg
+        jmodel_params, jfit_param_indices, (lower, upper) = self.joint_model_to_fit_params(models)
+        param_units = self._get_param_units(models)
+        # residuals are (y - model) / sigma, so the sum of their squares is the chi-squared
+        scales = [None] * len(ys) if weights is None else [np.sqrt(w) for w in weights]
+
+        def residuals(fps):
+            self._update_model_params_twice(models, fps, jfit_param_indices)
+            outputs = self._evaluate_models(models, xs, parameter_units=param_units)
+            return np.concatenate([_residual(y, out, scale) for y, out, scale in zip(ys, outputs, scales)])
+
+        start = np.clip(np.asarray(jmodel_params, dtype=float), lower, upper)
+        result = self._opt_method(residuals, start, bounds=(lower, upper), **optkwarg)
+
+        self.fit_info.update(
+            {
+                "params": result.x,
+                "nfev": result.nfev,
+                "njev": result.njev,
+                "status": result.status,
+                "message": result.message,
+                "success": result.success,
+                "statistic": 2 * result.cost,
+            }
+        )
+        return self._update_model_params_with_result(models, jfit_param_indices, result.x)
+
+
+def _residual(y, model_y, scale):
+    """``(y - model_y) * scale`` as plain numbers (dimensionless when weighted)."""
+    difference = y - model_y
+    if scale is not None:
+        difference = difference * scale
+    if isinstance(difference, u.Quantity):
+        unit = u.dimensionless_unscaled if scale is not None else difference.unit
+        return np.ravel(difference.to_value(unit))
+    return np.ravel(np.asarray(difference, dtype=float))
