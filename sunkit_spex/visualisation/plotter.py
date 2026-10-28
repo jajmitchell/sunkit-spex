@@ -36,6 +36,7 @@ import astropy.units as u
 from astropy.modeling import CompoundModel, Parameter
 from astropy.time import Time
 
+from sunkit_spex.fitting.fitters import ModelList
 from sunkit_spex.models.instrument_response import MatrixModel
 from sunkit_spex.models.physical.albedo import Albedo
 from sunkit_spex.models.scaling import Constant, InverseSquareFluxScaling
@@ -412,6 +413,10 @@ _ALBEDO_LOOK = {"width": 0.6, "alpha": 0.6, "zorder": 1}
 _LAYOUTS = ("separate", "combined")
 _HIGHLIGHTS = ("auto", "band", "halo", "bar", None)
 _LEGENDS = ("outside", "inside", None)
+# Stacked fit-range bars keep to this fraction of the residual panel, and are labelled when there
+# are no more than this many.
+_BAR_SPACE = 0.3
+_MAX_BAR_LABELS = 6
 #: Colour marking the fitted energy range.
 HIGHLIGHT_COLOUR = "#ffe680"
 # Data outside the fitted range are drawn faded.
@@ -422,6 +427,9 @@ _CAP_SIZE = 1.5
 # Size and colour of the observation time above a plot: a little larger and darker than the grey details.
 _TIME_SIZE = "medium"
 _TIME_COLOUR = "0.2"
+# Height kept free of the summary box (titles, energy label), in inches; a taller box is split
+# into columns.
+_KEY_MARGIN = 0.9
 # Gap between the plots and the summary box beside them, in inches.
 _KEY_GAP = 0.12
 # Where a key inside the plot may go, in order of preference; the upper ones can
@@ -503,8 +511,10 @@ def plot_fit(
         Display names by model name, overriding `DISPLAY_NAMES`, e.g.
         ``{"ThermalEmission": "Hot plasma"}``.
     labels : `list` [`str`], optional
-        Names of the spectra in a joint fit. Defaults to ``meta["instrument"]``
-        or "Spectrum 1", "Spectrum 2", ...
+        Names of the spectra in a joint fit. Defaults to
+        `~sunkit_spex.fitting.fitter.FitManager.names`: their names in an
+        `~ndcube.NDCollection`, else ``meta["instrument"]``, else
+        "Spectrum 1", "Spectrum 2", ...
     parameter_labels : `dict`, optional
         ``{parameter name: (symbol, unit string)}`` overriding the defaults.
     xscale : {"log", "linear"}, optional
@@ -572,9 +582,9 @@ def plot_fit(
     }
 
     spectra = fit_manager.fit_spectra
-    models = fit_manager.fitted_models if fitted else _with_ties_applied(fit_manager.prepared_models)
+    models = fit_manager.fitted_models if fitted else _with_ties_applied(fit_manager.prepared_models, fit_manager.names)
     n = len(spectra)
-    labels = list(labels) if labels is not None else [_spectrum_name(s, i) for i, s in enumerate(spectra)]
+    labels = list(labels) if labels is not None else fit_manager.names
     datasets = []
     for i, (model, spectrum, name) in enumerate(zip(models, spectra, labels)):
         fit_edges = u.Quantity(spectrum.spectral_axis.bin_edges)
@@ -638,14 +648,15 @@ def plot_fit(
         else:
             # One line above the plot: the title and the time on the left, the reduced chi-squared
             # on the right. Spectra sharing a plot have their times in the key.
-            time = datasets[0]["time"] if not combined else None
+            # Spectra sharing a plot have their times in the key, unless it is one time for all.
+            time = datasets[0]["time"] if not datasets[0]["own_time"] else None
             left = "   ".join(filter(None, [heading, time]))
             if left:
                 size = rc["axes.titlesize"] if heading else _TIME_SIZE
                 axes[0, 0].set_title(left, loc="left", fontsize=size, color="0.1" if heading else _TIME_COLOUR)
             right = []
             if combined and legend is None:
-                right = [f"{d['name']}: {d['time']}" for d in datasets if d["time"]]
+                right = [f"{d['name']}: {d['own_time']}" for d in datasets if d["own_time"]]
             if legend != "outside":
                 right.append(overall)
             axes[0, 0].set_title("\n".join(right), loc="right", fontsize="small", color="0.35")
@@ -657,6 +668,13 @@ def plot_fit(
             key_axes.set_axis_off()
             entries = _key_entries(keys, combined=combined, full=True)
             key = _draw_key(key_axes, entries, title=overall, combined=combined, summary=True)
+            # A key taller than the figure is split into columns side by side, rather than stretching
+            # the plots or running off the figure.
+            tall = key.get_window_extent(fig.canvas.get_renderer()).height / fig.dpi
+            columns_needed = math.ceil(tall / max(fig.get_size_inches()[1] - _KEY_MARGIN, 1))
+            if columns_needed > 1:
+                key.remove()
+                key = _draw_key(key_axes, entries, title=overall, combined=combined, summary=True, ncols=columns_needed)
             key.set_in_layout(False)
             _size_key_column(fig, outer, key, key_axes, axes[0, 0], columns, panel_width, keep_size=figsize is not None)
         elif legend == "inside":
@@ -747,10 +765,15 @@ def _format_time_range(start, end):
 
 
 def _mark_differences(datasets):
-    """``own_range``: each spectrum's fit range when they differ (else `None`, as it is shown once for all)."""
+    """
+    ``own_range`` and ``own_time``: each spectrum's fit range and time when they
+    differ between the spectra (else `None`, as they can be shown once for all).
+    """
     ranges = {d["fit_text"] for d in datasets}
+    times = {d["time"] for d in datasets}
     for d in datasets:
         d["own_range"] = d["fit_text"] if len(ranges) > 1 else None
+        d["own_time"] = d["time"] if len(times) > 1 else None
 
 
 def _chi2_text(d):
@@ -760,12 +783,12 @@ def _chi2_text(d):
     return rf"$\chi^2$ = {d['chi2']:.1f}"
 
 
-def _with_ties_applied(models):
+def _with_ties_applied(models, names):
     """
     Copies of the (initial) models with tied parameters set from what they are
     tied to; the fitters only do this while fitting.
     """
-    models = [copy.deepcopy(model) for model in models]
+    models = ModelList([copy.deepcopy(model) for model in models], names)
     for model in models:
         for name in model.param_names:
             tie = model.tied[name]
@@ -869,10 +892,6 @@ def _full_spectrum(fit_manager, index, model):
         return fit_manager._prepare(model, fit_manager.spectra[index], None)
 
 
-def _spectrum_name(spectrum, index):
-    return str(spectrum.meta.get("instrument") or f"Spectrum {index + 1}")
-
-
 def _prepare_dataset(fit_manager, model, spectrum, y, options, fit_edges):
     """Everything needed to draw one spectrum and its model, in the requested ``y`` units."""
     edges = u.Quantity(spectrum.spectral_axis.bin_edges)
@@ -939,6 +958,7 @@ def _darken(colour, amount):
 def _draw_group(ax, ax_res, group, options, xscale, combined):
     """Draw one or more spectra (``combined``) on a spectrum and a residual axis; returns what the key needs."""
     keys = []
+    bar_slots = _bar_slots(group)
     for d in group:
         look = _DATASET_LOOKS[d["index"] % len(_DATASET_LOOKS)] if combined else _DATASET_LOOKS[0]
         d["look"] = look
@@ -966,7 +986,9 @@ def _draw_group(ax, ax_res, group, options, xscale, combined):
             )
             component_handles = _draw_components(ax, d, look, combined) if options["show_components"] else {}
         _draw_residuals(ax_res, d, look, combined)
-        highlight = _draw_highlight(ax, ax_res, d, options["highlight"], combined, list(component_handles))
+        highlight = _draw_highlight(
+            ax, ax_res, d, options["highlight"], combined, list(component_handles), slot=bar_slots[d["index"]]
+        )
         keys.append((d, data_handle, model_handle, component_handles, single, highlight))
 
     ax.set_yscale("log")
@@ -1022,7 +1044,23 @@ def _draw_data(ax, d, look, combined):
     return _points(ax, d["centres"], d["data"], d["error"], look, combined, d["fitted"], edges=d["edges"], zorder=2)
 
 
-def _draw_highlight(ax, ax_res, d, style, combined, drawn_components):
+def _bar_slots(group):
+    """
+    ``{spectrum index: (slot, n_slots, first, label)}``: spectra sharing a plot
+    and a fit range share one bar; the bars for different ranges are stacked.
+    """
+    ranges = {d["index"]: tuple(np.round(d["fit_range"], 9)) for d in group}
+    distinct = list(dict.fromkeys(ranges.values()))
+    slots, drawn = {}, set()
+    for d in group:
+        sharing = [e["name"] for e in group if ranges[e["index"]] == ranges[d["index"]]]
+        label = ", ".join(sharing) if len(sharing) <= 2 else f"{len(sharing)} spectra"
+        slots[d["index"]] = (distinct.index(ranges[d["index"]]), len(distinct), ranges[d["index"]] not in drawn, label)
+        drawn.add(ranges[d["index"]])
+    return slots
+
+
+def _draw_highlight(ax, ax_res, d, style, combined, drawn_components, slot=None):
     """Mark the fitted energy range; returns a key handle, or `None`."""
     if style is None or not d["fitted"].any():
         return None
@@ -1034,9 +1072,13 @@ def _draw_highlight(ax, ax_res, d, style, combined, drawn_components):
         return Patch(facecolor=HIGHLIGHT_COLOUR, alpha=0.35, lw=0)
 
     if style == "bar":
-        # A strip along the bottom of the residual panel; stacked when spectra share a plot.
-        height = 0.06
-        bottom = d["index"] * height * 1.15 if combined else 0
+        # A strip along the bottom of the residual panel: one for each fit range when spectra
+        # share a plot, stacked and kept within the lower part of the panel.
+        position, n_slots, first, label = slot or (0, 1, True, None)
+        if not first:
+            return Patch(facecolor=HIGHLIGHT_COLOUR, lw=0)  # drawn with another spectrum with this range
+        height = min(0.06, _BAR_SPACE / n_slots)
+        bottom = position * height * 1.15
         # Energy along x, axes fraction up y.
         transform = blended_transform_factory(ax_res.transData, ax_res.transAxes)
         strip = Rectangle(
@@ -1049,12 +1091,12 @@ def _draw_highlight(ax, ax_res, d, style, combined, drawn_components):
             zorder=0.6,
         )
         ax_res.add_patch(strip)
-        if combined:
-            # Say which spectrum each bar belongs to.
+        if 1 < n_slots <= _MAX_BAR_LABELS:
+            # Say which spectra each bar belongs to (with many, the ranges are in the key).
             ax_res.text(
                 high,
                 bottom + height / 2,
-                f" {d['name']}",
+                f" {label}",
                 transform=transform,
                 ha="left",
                 va="center",
@@ -1241,9 +1283,9 @@ def _key_entries(keys, *, combined, full):
             if full:
                 text = f"{text}   {_chi2_text(d)}"
             entries.append((handle, text, "item", "0.15"))
-            if d["time"] and with_handles:
-                # Spectra sharing a plot: each one's time under its name.
-                entries.append((blank, d["time"], "param", "0.35"))
+            if d["own_time"] and with_handles:
+                # Spectra sharing a plot from different times: each one's time under its name.
+                entries.append((blank, d["own_time"], "param", "0.35"))
 
     if combined:
         spectra(with_handles=True)
@@ -1274,7 +1316,7 @@ def _key_entries(keys, *, combined, full):
     return entries
 
 
-def _draw_key(target, entries, *, title=None, loc="upper right", combined=False, summary=False):
+def _draw_key(target, entries, *, title=None, loc="upper right", combined=False, summary=False, ncols=1):
     """
     Draw the key on the axes ``target``: the ``summary`` box, from its top left
     corner, or a compact key at ``loc``.
@@ -1293,6 +1335,8 @@ def _draw_key(target, entries, *, title=None, loc="upper right", combined=False,
         # Long enough to show a dotted or dash-dot line.
         "handlelength": 2.8 if combined else 1.8,
         "borderpad": 0.9 if outside else 0.6,
+        "ncols": ncols,
+        "columnspacing": 1.6,
     }
     if outside:
         # Its top on the top of the axes (level with the plots), a little in from the left.
@@ -1331,9 +1375,10 @@ def _size_key_column(fig, grid, key, key_axes, panel_axes, columns, panel_width,
     Size the summary box's column to the box; without a figure size given, widen
     the figure to hold it (and heighten it if the box is taller than the plots).
     """
-    box = key.get_window_extent(fig.canvas.get_renderer())
-    need, key_height = box.width / fig.dpi + 2 * _KEY_GAP, box.height / fig.dpi
+    renderer = fig.canvas.get_renderer()
     width, height = fig.get_size_inches()
+    box = key.get_window_extent(renderer)
+    need, key_height = box.width / fig.dpi + 2 * _KEY_GAP, box.height / fig.dpi
     if keep_size:
         panel_width = max((width - need) / columns, 0.5)
     else:

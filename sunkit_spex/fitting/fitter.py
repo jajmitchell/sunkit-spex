@@ -13,18 +13,20 @@ dispatching on their type, so they do not need any particular name.
 
 import copy
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
+from ndcube import NDCollection, NDCubeSequence
 
 import astropy.units as u
 from astropy.modeling import CompoundModel, Model, Parameter, fitting
 from astropy.nddata import StdDevUncertainty
 
-from sunkit_spex.fitting.fitters import JointFitter, LeastSquaresJointFitter, ScipyMinimizeJointFitter 
+from sunkit_spex.fitting.fitters import JointFitter, LeastSquaresJointFitter, ModelList
 from sunkit_spex.models.instrument_response import MatrixModel
 from sunkit_spex.models.physical.albedo import Albedo
-from sunkit_spex.models.scaling import InverseSquareFluxScaling
+from sunkit_spex.models.scaling import Constant, InverseSquareFluxScaling
 from sunkit_spex.spectrum import Spectrum
 
 __all__ = ["DEFAULT_META_KEYS", "FitManager", "leaf_models"]
@@ -40,6 +42,7 @@ DEFAULT_META_KEYS = {
     "exposure_time": "exposure_time",
     "albedo_angle": "angle",
     "observer_distance": "distance",
+    "time_range": "time_range",
 }
 
 # Warnings point at the user's code rather than at this module.
@@ -89,25 +92,48 @@ class FitManager:
 
     Parameters
     ----------
-    models : `~astropy.modeling.Model` or `list` [`~astropy.modeling.Model`]
-        Model, or one model per spectrum. The models are copied, so the
-        originals are never modified.
-    spectra : `~sunkit_spex.spectrum.Spectrum` or `list` [`~sunkit_spex.spectrum.Spectrum`]
-        Spectrum, or list of spectra, to fit.
+    models : `~astropy.modeling.Model`, `list` or `dict` [`str`, `~astropy.modeling.Model`]
+        One model per spectrum: a list in the order of the spectra or, with
+        named spectra, a dict keyed by the same names. Or a single model for
+        every spectrum: each gets a copy, with its free parameters shared
+        (tied to the reference spectrum's) apart from those in ``separate``.
+        The models are copied, so the originals are never modified.
+    spectra : `~sunkit_spex.spectrum.Spectrum`, `list` or `~ndcube.NDCollection`
+        Spectrum, a list of spectra, or named spectra: an
+        `~ndcube.NDCollection` (or any dict) of spectra, such as stixpy gives
+        for separate detectors. Names are used in plots and can be used to tie
+        parameters, see Notes.
     fitter : `~sunkit_spex.fitting.fitters.JointFitter` or Astropy fitter, optional
         Fitter to use. A joint fitter fits all model/spectrum pairs
         simultaneously; a standard Astropy fitter fits a single pair, see
         Notes. Defaults to ``TRFLSQFitter(calc_uncertainties=True)`` for a
         single spectrum and to
-        `~sunkit_spex.fitting.fitters.ScipyMinimizeJointFitter` for several.
-    fit_range : `tuple` or `list` [`tuple` or `None`], optional
+        `~sunkit_spex.fitting.fitters.LeastSquaresJointFitter`, the same
+        trust region least-squares method, for several. To fit with another
+        statistic (e.g. Cash), pass a
+        `~sunkit_spex.fitting.fitters.ScipyMinimizeJointFitter`.
+    fit_range : `tuple`, `list` [`tuple` or `None`] or `dict`, optional
         ``(min, max)`` energy range to fit, applied to every spectrum, or one
-        range (or `None` for all bins) per spectrum. Only bins lying entirely
+        range (or `None` for all bins) per spectrum: a list in their order or,
+        with named spectra, a dict by name (spectra left out are fitted over
+        all their bins). Only bins lying entirely
         within the range are fitted. Plain numbers are taken to be in the
         units of the spectral axis.
     meta_keys : `dict`, optional
         Overrides for `DEFAULT_META_KEYS`, mapping what is needed to the
         ``Spectrum.meta`` key it is stored under.
+    separate : `str` or `list` [`str`], optional
+        With a single model for every spectrum: the parameters fitted to each
+        spectrum separately rather than shared, by full name
+        (``"constant_0"``) or by a name that picks every such parameter
+        (``"constant"``). A separate
+        `~sunkit_spex.models.scaling.Constant` (a calibration constant) stays
+        fixed in the reference spectrum, which the others are calibrated
+        against. See ``model.param_names`` for the names.
+    reference : `str` or `int`, optional
+        With a single model for every spectrum: the spectrum, by name or
+        position, whose parameters the others share and whose calibration
+        constant stays fixed. Defaults to the first.
 
     Notes
     -----
@@ -139,6 +165,17 @@ class FitManager:
     When fitting several spectra, parameters can be tied across models using
     the model list passed to the joint fitter, e.g.
     ``model_b.temperature_0.tied = lambda models: models[0].temperature_0``.
+    With named spectra (e.g. an `~ndcube.NDCollection`) models can also be
+    picked by name: ``models["STIX"].temperature_0``.
+
+    To fit the same model to many spectra (e.g. STIX detectors), give it once
+    with ``separate`` for what differs between them::
+
+        model = (Constant() * (ThermalEmission() + ThickTarget()) * InverseSquareFluxScaling()) | Albedo() | MatrixModel()
+        fm = FitManager(model, collection, separate="constant", reference="BKG")
+
+    fits one thermal and thick-target spectrum to every detector, with a
+    calibration constant for each detector but the reference.
 
     Unless given explicitly, fit weights are derived from the spectrum
     uncertainty ``sigma`` following each fitter's convention: ``1/sigma**2``
@@ -158,7 +195,7 @@ class FitManager:
     --------
     >>> import numpy as np
     >>> import astropy.units as u
-    >>> from sunkit_spex.fitting.fit_manager import FitManager
+    >>> from sunkit_spex.fitting.fitter import FitManager
     >>> from sunkit_spex.models.models import StraightLineModel
     >>> from sunkit_spex.spectrum import Spectrum
     >>> edges = np.arange(1, 12) * u.keV
@@ -170,9 +207,45 @@ class FitManager:
     array([2., 1.])
     """
 
-    def __init__(self, models, spectra, fitter=None, fit_range=None, meta_keys=None):
-        models = [models] if isinstance(models, Model) else list(models)
-        spectra = list(spectra) if isinstance(spectra, (list, tuple)) else [spectra]
+    def __init__(self, models, spectra, fitter=None, fit_range=None, meta_keys=None, *, separate=None, reference=None):
+        keys = None
+        if isinstance(spectra, Mapping):
+            # Named spectra, e.g. an NDCollection.
+            keys = list(spectra)
+            spectra = list(spectra.values())
+        elif isinstance(spectra, (list, tuple)):
+            spectra = list(spectra)
+        else:
+            spectra = [spectra]
+        for i, spectrum in enumerate(spectra):
+            if isinstance(spectrum, NDCubeSequence):
+                name = repr(keys[i]) if keys is not None else f"Spectrum {i + 1}"
+                raise TypeError(
+                    f"{name} is a sequence of {len(spectrum.data)} spectra (one per time bin), but each model is "
+                    "fitted to one spectrum. Fit one time bin at a time, e.g. "
+                    "NDCollection([(key, sequence[0]) for key, sequence in collection.items()])."
+                )
+
+        if (separate is not None or reference is not None) and not isinstance(models, Model):
+            raise TypeError("separate and reference apply to a single model given for every spectrum.")
+        if isinstance(models, Mapping):
+            if keys is None:
+                raise TypeError("Models given by name need named spectra, e.g. an NDCollection.")
+            unknown, missing = set(models) - set(keys), set(keys) - set(models)
+            if unknown or missing:
+                raise KeyError(
+                    f"Models and spectra must have the same names; no spectrum for {sorted(map(str, unknown))}, "
+                    f"no model for {sorted(map(str, missing))}."
+                )
+            models = [models[key] for key in keys]
+        elif isinstance(models, Model):
+            if len(spectra) > 1 or separate is not None:
+                reference = _spectrum_index(reference, keys, len(spectra))
+                models = _shared_models(models, len(spectra), separate, reference)
+            else:
+                models = [models]
+        else:
+            models = list(models)
         if len(models) != len(spectra):
             raise ValueError(f"Got {len(models)} model(s) but {len(spectra)} spectra; need one model per spectrum.")
         if len(models) == 0:
@@ -180,6 +253,7 @@ class FitManager:
 
         self._models = models
         self._spectra = spectra
+        self._keys = keys
         self._meta_keys = DEFAULT_META_KEYS | (meta_keys or {})
         self.fitter = self._default_fitter() if fitter is None else fitter
         self.fit_range = fit_range
@@ -189,13 +263,34 @@ class FitManager:
     # ------------------------------------------------------------------ #
     @property
     def models(self):
-        """The models as given (never modified)."""
+        """
+        The models as given (never modified), or, for a single model given for
+        several spectra, its copies with the shared parameters tied.
+        """
         return list(self._models)
 
     @property
     def spectra(self):
         """The spectra being fitted."""
         return list(self._spectra)
+
+    @property
+    def names(self):
+        """
+        `list` [`str`]: a name for each spectrum: its key in a named collection,
+        else its ``meta["instrument"]``, else "Spectrum 1", "Spectrum 2", ...
+        """
+        if self._keys is not None:
+            return [str(key) for key in self._keys]
+        return [str(s.meta.get("instrument") or f"Spectrum {i + 1}") for i, s in enumerate(self._spectra)]
+
+    @property
+    def fit_collection(self):
+        """
+        `~ndcube.NDCollection`: the spectra as fitted (see `fit_spectra`),
+        by name.
+        """
+        return NDCollection(list(zip(self.names, self.fit_spectra)))
 
     @property
     def is_joint(self):
@@ -232,6 +327,13 @@ class FitManager:
 
     @fit_range.setter
     def fit_range(self, value):
+        if isinstance(value, Mapping):
+            if self._keys is None:
+                raise TypeError("Fit ranges given by name need named spectra, e.g. an NDCollection.")
+            unknown = set(value) - set(self._keys)
+            if unknown:
+                raise KeyError(f"No spectrum named {sorted(map(str, unknown))}; the names are {self.names}.")
+            value = [value.get(key) for key in self._keys]
         if value is None or _is_single_range(value):
             ranges = [value] * len(self._spectra)
         else:
@@ -340,7 +442,7 @@ class FitManager:
                 for item in (model, self._model_x(model, spectrum), _data(spectrum))
             ]
             # Fit copies so the prepared models keep their initial values.
-            fitted = self._fitter(*args, fkwarg=fkwarg, inplace=False, **kwargs)
+            fitted = self._fitter(*args, fkwarg=fkwarg, inplace=False, names=self.names, **kwargs)
         else:
             ((model, spectrum),) = prepared
             (sigma,) = sigmas
@@ -355,7 +457,11 @@ class FitManager:
             # The joint fitters (and some Astropy fitters) give no uncertainties: estimate them.
             xs = [self._model_x(model, spectrum) for model, spectrum in prepared]
             ys = [_data(spectrum) for _, spectrum in prepared]
-            self._covariance = _add_uncertainties(self._fitted_models, xs, ys, sigmas, self._uses_joint_fitter)
+            # The least-squares fitter gives its Jacobian at the solution: no need to work it out again.
+            jacobian = (self.fit_info or {}).get("jac") if self._uses_joint_fitter else None
+            self._covariance = _add_uncertainties(
+                self._fitted_models, xs, ys, sigmas, self._uses_joint_fitter, names=self.names, jacobian=jacobian
+            )
         return self._fitted_models if self.is_joint else self._fitted_models[0]
 
     def evaluate(self, fitted=True):
@@ -365,16 +471,80 @@ class FitManager:
         Parameters
         ----------
         fitted : `bool`, optional
-            Use the fitted models (default) or the initial ones.
+            Use the fitted models (default) or the initial ones (with tied
+            parameters set from what they are tied to).
 
         Returns
         -------
         `list` [`~astropy.units.Quantity`]
             Model values in data space, one array per spectrum.
         """
-        prepared = self._get_prepared()
-        models = self.fitted_models if fitted else [model for model, _ in prepared]
-        return [model(self._model_x(model, spectrum)) for model, (_, spectrum) in zip(models, prepared)]
+        models = self.fitted_models if fitted else self._initial_models()
+        return [model(self._model_x(model, spectrum)) for model, spectrum in zip(models, self.fit_spectra)]
+
+    def fit_statistic(self, fitted=True):
+        r"""
+        The chi-squared of the fit, over each spectrum's fitted bins.
+
+        .. math::
+
+            \chi^2 = \sum_i \left(\frac{D_i - M_i}{\sigma_i}\right)^2
+
+        in counts, with :math:`\sigma` the spectrum's uncertainty; bins with
+        zero or invalid uncertainty are left out, as in the fit. The degrees
+        of freedom are the fitted bins less the free (neither fixed nor tied)
+        parameters. Each spectrum is given a share of the free parameters in
+        proportion to its bins (shared parameters can't be given to one
+        spectrum), so the spectra's degrees of freedom add up to the total.
+
+        Parameters
+        ----------
+        fitted : `bool`, optional
+            For the fitted models (default) or the initial ones.
+
+        Returns
+        -------
+        `dict`
+            ``chi2``, ``dof``, ``chi2_red`` (`numpy.nan` without degrees of
+            freedom), ``n_bins`` and ``n_free`` for the whole fit, and
+            ``spectra``: a `list` with, for each spectrum in order, a `dict`
+            of its ``name``, ``chi2``, ``n_bins``, ``dof`` and ``chi2_red``.
+            Spectra without uncertainties have a ``chi2`` of `numpy.nan`.
+        """
+        models = self.fitted_models if fitted else self._initial_models()
+        spectra = []
+        for name, model, spectrum in zip(self.names, models, self.fit_spectra):
+            data, sigma = _data(spectrum), _stddev(spectrum)
+            if sigma is None:
+                spectra.append({"name": name, "chi2": np.nan, "n_bins": data.size})
+                continue
+            expected = model(self._model_x(model, spectrum))
+            expected = expected if isinstance(expected, u.Quantity) else expected * data.unit
+            usable = np.isfinite(sigma.value) & (sigma.value > 0)
+            residuals = ((data[usable] - expected[usable]) / sigma[usable]).to_value(u.dimensionless_unscaled)
+            spectra.append({"name": name, "chi2": float(np.sum(residuals**2)), "n_bins": int(usable.sum())})
+
+        n_free = sum(sum(not m.fixed[p] and not m.tied[p] for p in m.param_names) for m in models)
+        n_bins = sum(s["n_bins"] for s in spectra)
+        for s in spectra:
+            s["dof"] = s["n_bins"] * (1 - n_free / n_bins) if n_bins else 0
+            s["chi2_red"] = s["chi2"] / s["dof"] if s["dof"] > 0 else np.nan
+        chi2 = float(sum(s["chi2"] for s in spectra))
+        dof = n_bins - n_free
+        return {
+            "chi2": chi2,
+            "dof": dof,
+            "chi2_red": chi2 / dof if dof > 0 else np.nan,
+            "n_bins": n_bins,
+            "n_free": n_free,
+            "spectra": spectra,
+        }
+
+    def _initial_models(self):
+        """Copies of the prepared models with tied parameters set; the fitters only do this while fitting."""
+        models = ModelList([copy.deepcopy(model) for model in self.prepared_models], self.names)
+        _apply_ties(models, self._uses_joint_fitter)
+        return models
 
     def plot(self, **kwargs):
         """
@@ -631,17 +801,87 @@ def _stddev(spectrum):
     raise TypeError(f"Unsupported uncertainty type {kind!r}.")
 
 
-def _add_uncertainties(models, xs, ys, sigmas, ties_take_list):
+def _spectrum_index(reference, keys, n):
+    """The index of the ``reference`` spectrum, given by name or position (default the first)."""
+    if reference is None:
+        return 0
+    if keys is not None and reference in keys:
+        return keys.index(reference)
+    if isinstance(reference, (int, np.integer)) and -n <= reference < n:
+        return int(reference) % n
+    names = f"; the names are {[str(key) for key in keys]}" if keys is not None else ""
+    raise KeyError(f"No spectrum {reference!r}{names}.")
+
+
+def _shared_models(template, n, separate, reference):
+    """
+    ``n`` copies of ``template``, one per spectrum, sharing its free parameters.
+
+    Every free parameter of the copies is tied to the reference copy's, except
+    the ``separate`` ones (full names, e.g. ``"constant_0"``, or a name shared
+    by every such parameter, e.g. ``"constant"``), which are fitted to each
+    spectrum. A separate `~sunkit_spex.models.scaling.Constant` (a calibration
+    constant) stays fixed in the reference spectrum, which the others are
+    calibrated against: free in every spectrum it would duplicate the shared
+    normalisation.
+    """
+    separate = _parameter_names(template, separate or ())
+    leaf_of = _leaf_of_parameter(template)
+    models = [copy.deepcopy(template) for _ in range(n)]
+    for i, model in enumerate(models):
+        for name in model.param_names:
+            param = getattr(model, name)
+            if name in separate:
+                param.tied = False
+                param.fixed = isinstance(leaf_of[name], Constant) and i == reference
+            elif i != reference and not template.fixed[name] and not template.tied[name]:
+                param.tied = _tie_to(reference, name)
+    return models
+
+
+def _tie_to(index, name):
+    def tie(models):
+        return getattr(models[index], name)
+
+    return tie
+
+
+def _leaf_of_parameter(model):
+    """``{parameter name: the simple model it belongs to}``."""
+    leaves = leaf_models(model)
+    param_map = getattr(model, "_param_map", None)
+    if not param_map:
+        return dict.fromkeys(model.param_names, model)
+    return {name: leaves[param_map[name][0]] for name in model.param_names}
+
+
+def _parameter_names(model, wanted):
+    """Full parameter names for ``wanted``: full names, or plain names matching every such parameter."""
+    wanted = [wanted] if isinstance(wanted, str) else list(wanted)
+    param_map = getattr(model, "_param_map", None) or {name: (0, name) for name in model.param_names}
+    names = set()
+    for item in wanted:
+        matches = [name for name in model.param_names if item in (name, param_map[name][1])]
+        if not matches:
+            raise KeyError(f"No parameter {item!r} in the model; its parameters are {list(model.param_names)}.")
+        names.update(matches)
+    return names
+
+
+def _add_uncertainties(models, xs, ys, sigmas, ties_take_list, names=None, jacobian=None):
     """
     Estimate the covariance of the free parameters of ``models`` (fitted to
     ``ys`` at ``xs``) together, and give each model its ``cov_matrix`` and
     ``stds``. Returns ``(parameters, matrix)``, or `None` if it can't be
-    estimated.
+    estimated. A ``jacobian`` of the residuals ``(y - model) / sigma`` at the
+    fitted values (as the least-squares fitter gives, one column per free
+    parameter) is used as it is rather than worked out again.
     """
     free = [(i, name) for i, m in enumerate(models) for name in m.param_names if not m.fixed[name] and not m.tied[name]]
     if not free:
         return None
-    work = [copy.deepcopy(model) for model in models]
+    # Named, so ties can refer to models by name as the fitter lets them.
+    work = ModelList([copy.deepcopy(model) for model in models], names)
     params = [getattr(work[i], name) for i, name in free]
     weighted = all(sigma is not None for sigma in sigmas)
     with warnings.catch_warnings():
@@ -660,7 +900,10 @@ def _add_uncertainties(models, xs, ys, sigmas, ties_take_list):
         )
 
     best = np.array([param.value for param in params], dtype=float)
-    jacobian = np.empty((residuals(best).size, best.size))
+    n_residuals = sum(np.size(y) for y in ys)
+    if jacobian is not None and np.shape(jacobian) == (n_residuals, best.size):
+        return _set_uncertainties(models, free, jacobian, residuals(best) if not weighted else None)
+    jacobian = np.empty((n_residuals, best.size))
     for k, (param, value) in enumerate(zip(params, best)):
         # Central differences, one-sided next to a bound.
         step = 1e-5 * abs(value) if value else 1e-8
@@ -670,8 +913,15 @@ def _add_uncertainties(models, xs, ys, sigmas, ties_take_list):
         shifted_up, shifted_down = best.copy(), best.copy()
         shifted_up[k], shifted_down[k] = up, down
         jacobian[:, k] = (residuals(shifted_up) - residuals(shifted_down)) / (up - down)
-    residual = residuals(best)
+    return _set_uncertainties(models, free, jacobian, residuals(best) if not weighted else None)
 
+
+def _set_uncertainties(models, free, jacobian, residual=None):
+    """
+    The covariance ``inv(J.T @ J)`` of the ``free`` parameters, ``(model index, name)``;
+    each model gets its block as ``cov_matrix`` and ``stds``. Without measurement
+    uncertainties, ``residual`` scales it by the scatter about the fit.
+    """
     try:
         matrix = np.linalg.inv(jacobian.T @ jacobian)
     except np.linalg.LinAlgError:
@@ -680,9 +930,9 @@ def _add_uncertainties(models, xs, ys, sigmas, ties_take_list):
             skip_file_prefixes=_WARN_SKIP,
         )
         return None
-    if not weighted:
+    if residual is not None:
         # No measurement uncertainties: scale by the scatter about the fit, as scipy's curve_fit does.
-        dof = residual.size - best.size
+        dof = residual.size - len(free)
         if dof > 0:
             matrix = matrix * np.sum(residual**2) / dof
 

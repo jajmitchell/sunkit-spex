@@ -1,4 +1,3 @@
-import numpy as np
 import warnings
 
 import numpy as np
@@ -10,10 +9,41 @@ from astropy.modeling.fitting import Fitter, _validate_model, model_to_fit_param
 from sunkit_spex.fitting.metrics import statistics
 from sunkit_spex.fitting.optimizers import minimizers
 
-__all__ = ["JointFitter", "LeastSquaresJointFitter", "ScipyMinimizeJointFitter"]
+__all__ = ["JointFitter", "LeastSquaresJointFitter", "ModelList", "ScipyMinimizeJointFitter"]
 
 
 DEFAULT_FIT_STATISTIC = statistics.chi_squared
+
+
+class ModelList(list):
+    """
+    A list of models that can also be indexed by name.
+
+    The joint fitters pass this to tied-parameter functions, so with named
+    spectra (e.g. an `~ndcube.NDCollection`) a parameter can be tied by name:
+    ``model_b.temperature_0.tied = lambda models: models["STIX"].temperature_0``.
+    Indexing by position works as for any list.
+
+    Parameters
+    ----------
+    models : iterable of `~astropy.modeling.Model`
+    names : iterable of `str`, optional
+        One name per model.
+    """
+
+    def __init__(self, models, names=None):
+        super().__init__(models)
+        self.names = [] if names is None else list(names)
+        if self.names and len(self.names) != len(self):
+            raise ValueError(f"Got {len(self.names)} names for {len(self)} models.")
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            try:
+                key = self.names.index(key)
+            except ValueError:
+                raise KeyError(f"No model named {key!r}; the names are {self.names}.") from None
+        return super().__getitem__(key)
 
 
 class JointFitter(Fitter):
@@ -99,8 +129,9 @@ class JointFitter(Fitter):
             model_params, fit_param_indices, model_bounds = model_to_fit_params(model)
             jmodel_params.extend(model_params)
             jfit_param_indices.append(fit_param_indices)
-            jmodel_bounds_lower.extend(model_bounds[0])
-            jmodel_bounds_upper.extend(model_bounds[1])
+            if len(fit_param_indices):  # a model with every parameter fixed or tied has no bounds to add
+                jmodel_bounds_lower.extend(model_bounds[0])
+                jmodel_bounds_upper.extend(model_bounds[1])
 
         # return
         jmodel_bounds = (tuple(jmodel_bounds_lower), tuple(jmodel_bounds_upper))
@@ -246,7 +277,7 @@ class JointFitter(Fitter):
         """
         raise NotImplementedError("Subclasses should implement this method.")
 
-    def __call__(self, *args, fkwarg=None, optkwarg=None, inplace=False):
+    def __call__(self, *args, fkwarg=None, optkwarg=None, inplace=False, names=None):
         """
         Fit data to these models keeping some of the parameters common to the
         two models.
@@ -267,6 +298,11 @@ class JointFitter(Fitter):
             updates should happen to copies of the models.
             Default: False
 
+        names : `list[str]` or `NoneType`
+            One name per model, so tied parameters can refer to models by
+            name as well as by position (see `ModelList`).
+            Default: None
+
         Returns
         =======
         `list[~astropy.modeling.FittableModel]` :
@@ -275,7 +311,7 @@ class JointFitter(Fitter):
         """
         self._verify_input(args)
 
-        models = list(args[::3])
+        models = ModelList(args[::3], names)
         xs = list(args[1::3])
         ys = list(args[2::3])
 
@@ -512,17 +548,26 @@ class ScipyMinimizeJointFitter(JointFitter):
         model_outputs = self._evaluate_models(models, xs, parameter_units=parameter_units)
 
         return self._stat_method(ys, model_outputs, data_y_weights=weights, **fkwarg)
-    
+
+
 class LeastSquaresJointFitter(JointFitter):
     r"""
     Joint fitter minimising the chi-squared with a trust region least-squares method.
 
     It minimises the same chi-squared as `ScipyMinimizeJointFitter` with its
-    default statistic, with weights 1/sigma**2, and handles fixed and tied
+    default statistic,
+
+    .. math::
+
+        \chi^2 = \sum_k \sum_i w_{k,i} \, (y_{k,i} - M_k(x_{k,i}))^2,
+
+    with weights :math:`w = 1/\sigma^2`, and handles fixed and tied
     parameters (including ties between models) and bounds in the same way.
-    It uses `scipy.optimize.least_squares` (trust region reflective, as
-    Astropy's ``TRFLSQFitter`` does for one model), which needs a small
-    fraction of the model evaluations Nelder-Mead does.
+    It uses `scipy.optimize.least_squares` (the trust region reflective
+    method, as Astropy's ``TRFLSQFitter`` does for one model), which follows
+    the Jacobian of the residuals rather than searching the parameter space
+    as Nelder-Mead does: it needs a small fraction of the model evaluations,
+    and the number grows only linearly with the number of free parameters.
 
     Use `ScipyMinimizeJointFitter` to fit with another statistic (e.g. Cash).
     """
@@ -532,10 +577,29 @@ class LeastSquaresJointFitter(JointFitter):
 
     def run_fitter(self, models, farg, fkwarg=None, optkwarg=None):
         """
-        Fit the models to the data. ``fkwarg`` takes ``{"weights": [w_1, ...]}``
-        (1/sigma**2 per model); ``optkwarg`` is passed to
-        `scipy.optimize.least_squares` (e.g. ``max_nfev``), by default with
-        ``method="trf"`` and ``x_scale="jac"``.
+        Fit the models to the data.
+
+        Parameters
+        ==========
+        models : `list[~astropy.modeling.FittableModel]`
+            The models being fitted.
+
+        farg : `tuple[list, list]`
+            The x-inputs and the y data of each model.
+
+        fkwarg : `dict` or `NoneType`
+            ``{"weights": [w_1, w_2, ...]}``, the weights (1/sigma**2) of each
+            model's data. Without weights every bin counts equally.
+
+        optkwarg : `dict` or `NoneType`
+            Passed to `scipy.optimize.least_squares` (e.g. ``max_nfev``,
+            ``diff_step``, ``ftol``). By default ``method="trf"`` and
+            ``x_scale="jac"``.
+
+        Returns
+        =======
+        `list[~astropy.modeling.FittableModel]` :
+            The models with their fitted parameter values.
         """
         fkwarg = {} if fkwarg is None else dict(fkwarg)
         weights = fkwarg.pop("weights", None)
@@ -563,13 +627,25 @@ class LeastSquaresJointFitter(JointFitter):
         # residuals are (y - model) / sigma, so the sum of their squares is the chi-squared
         scales = [None] * len(ys) if weights is None else [np.sqrt(w) for w in weights]
 
+        last = {}
+
         def residuals(fps):
             self._update_model_params_twice(models, fps, jfit_param_indices)
             outputs = self._evaluate_models(models, xs, parameter_units=param_units)
-            return np.concatenate([_residual(y, out, scale) for y, out, scale in zip(ys, outputs, scales)])
+            values = np.concatenate([_residual(y, out, scale) for y, out, scale in zip(ys, outputs, scales)])
+            last["x"], last["residuals"] = np.array(fps, dtype=float), values
+            return values
 
         start = np.clip(np.asarray(jmodel_params, dtype=float), lower, upper)
+        if not {"jac", "jac_sparsity"} & set(optkwarg) and optkwarg["method"] != "lm":
+            # Parameters of one spectrum only (a calibration constant, say) can be nudged together
+            # when estimating the Jacobian: a few model evaluations instead of one per parameter.
+            reach = self._parameter_reach(models, start, upper, jfit_param_indices)
+            if not reach.all():
+                rows = np.repeat(reach, [np.size(y) for y in ys], axis=0)
+                optkwarg["jac"] = _grouped_jacobian(residuals, last, rows, np.asarray(upper, dtype=float))
         result = self._opt_method(residuals, start, bounds=(lower, upper), **optkwarg)
+        jacobian = result.jac.toarray() if hasattr(result.jac, "toarray") else np.asarray(result.jac)
 
         self.fit_info.update(
             {
@@ -580,9 +656,75 @@ class LeastSquaresJointFitter(JointFitter):
                 "message": result.message,
                 "success": result.success,
                 "statistic": 2 * result.cost,
+                # The Jacobian of the residuals (y - model) / sigma at the solution, with a column for
+                # each free parameter in the order of ``params``.
+                "jac": jacobian,
             }
         )
         return self._update_model_params_with_result(models, jfit_param_indices, result.x)
+
+    def _parameter_reach(self, models, start, upper, jfit_param_indices):
+        """
+        ``(n_models, n_free)``: which models' outputs each free parameter can change.
+
+        A parameter changes its own model and every model with a parameter tied
+        to it. Each one is nudged in turn, applying the ties as the fit does,
+        to see which models' parameters follow; no model is evaluated.
+        """
+        owner = np.repeat(np.arange(len(models)), [len(indices) for indices in jfit_param_indices])
+        self._update_model_params_twice(models, start, jfit_param_indices)
+        before = [model.parameters.copy() for model in models]
+        reach = np.zeros((len(models), start.size), dtype=bool)
+        for k, value in enumerate(start):
+            step = 1e-3 * abs(value) + 1e-6
+            # away from a bound, where the nudge would be clipped back
+            nudged_value = value + step if value + step <= upper[k] else value - step
+            nudged = start.copy()
+            nudged[k] = nudged_value
+            self._update_model_params_twice(models, nudged, jfit_param_indices)
+            reach[:, k] = [not np.array_equal(model.parameters, old) for model, old in zip(models, before)]
+            reach[owner[k], k] = True
+        self._update_model_params_twice(models, start, jfit_param_indices)
+        return reach
+
+
+def _grouped_jacobian(residuals, last, rows, upper):
+    """
+    A Jacobian function for `scipy.optimize.least_squares`, by forward differences
+    as its own default, but nudging together parameters that change different
+    residuals (``rows``, ``(n_residuals, n_free)``): one evaluation per group
+    rather than per parameter. It returns the full Jacobian, so the solver
+    keeps its exact trust-region steps.
+    """
+    groups = []  # greedily, parameters reaching no residual in common
+    for column in range(rows.shape[1]):
+        for group in groups:
+            if not (group["rows"] & rows[:, column]).any():
+                group["columns"].append(column)
+                group["rows"] |= rows[:, column]
+                break
+        else:
+            groups.append({"columns": [column], "rows": rows[:, column].copy()})
+    relative_step = np.sqrt(np.finfo(float).eps)  # as least_squares' "2-point"
+
+    def jacobian(x):
+        x = np.asarray(x, dtype=float)
+        at_x = last.get("x") is not None and np.array_equal(last["x"], x)
+        base = last["residuals"] if at_x else residuals(x)
+        result = np.zeros((base.size, x.size))
+        for group in groups:
+            columns = group["columns"]
+            steps = relative_step * np.maximum(1, np.abs(x[columns]))
+            steps = np.where(x[columns] + steps > upper[columns], -steps, steps)  # away from an upper bound
+            nudged = x.copy()
+            nudged[columns] += steps
+            change = residuals(nudged) - base
+            for column, step in zip(columns, steps):
+                reached = rows[:, column]
+                result[reached, column] = change[reached] / step
+        return result
+
+    return jacobian
 
 
 def _residual(y, model_y, scale):
