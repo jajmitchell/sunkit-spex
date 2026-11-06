@@ -151,6 +151,13 @@ class FitManager:
       (and fixed state) it has in the model.
     * `~sunkit_spex.models.scaling.InverseSquareFluxScaling` gets the
       observer distance (fixed), if present in the metadata.
+    * A component in count space, e.g. a
+      `~sunkit_spex.models.models.GaussianModel` with its amplitude in counts,
+      gets the fitted count bin edges and the exposure time
+      (``meta["exposure_time"]``), so it can be added to a model folded
+      through the response:
+      ``((ThermalEmission() + ThickTarget()) | MatrixModel()) + GaussianModel(amplitude=5 * u.ct / (u.s * u.keV), ...)``.
+      It can't be folded through the response itself: it already gives counts.
 
     All fitting is done in count space. Spectra given as a count rate
     (ct s\ :sup:`-1`), per unit energy (ct keV\ :sup:`-1`) or both
@@ -619,6 +626,7 @@ class FitManager:
         spectrum = self._to_counts(spectrum)
 
         model = copy.deepcopy(model)
+        _check_count_space_placement(model)
         for leaf in leaf_models(model):
             if isinstance(leaf, MatrixModel):
                 if leaf.is_placeholder:
@@ -651,6 +659,13 @@ class FitManager:
                 if distance is not None:
                     leaf.observer_distance = distance
                     leaf.observer_distance.fixed = True
+            elif getattr(leaf, "count_space", False):
+                # Evaluated on the bins being fitted, whatever the model as a whole is evaluated on.
+                leaf.count_edges = u.Quantity(spectrum.spectral_axis.bin_edges)
+                needed = f"the {type(leaf).__name__} in count space" if leaf.needs_exposure_time else None
+                exposure = self._meta(spectrum, "exposure_time", required_for=needed)
+                if exposure is not None:
+                    leaf.exposure_time = exposure
 
         self._check_count_space(model, spectrum)
         return model, spectrum
@@ -691,7 +706,15 @@ class FitManager:
 
     def _check_count_space(self, model, spectrum):
         """Check the prepared model gives counts for every fitted bin."""
-        output = model(self._model_x(model, spectrum))
+        x = self._model_x(model, spectrum)
+        try:
+            output = model(x)
+        except ValueError as error:  # including unit errors
+            mismatch = "broadcast" in str(error) or "compatible dimensions" in str(error)
+            hint = _mismatch_hint(model, x) if mismatch else None
+            if hint is None:
+                raise
+            raise ValueError(f"{error}. {hint}") from error
         if not isinstance(output, u.Quantity) or not output.unit.is_equivalent(u.ct):
             unit = getattr(output, "unit", None)
             raise u.UnitsError(
@@ -721,6 +744,84 @@ def _count_form(data_unit, energy_unit):
         f"FitManager fits in count space; can not convert data in {data_unit} to counts. Expected counts, a count "
         "rate, counts per unit energy, or a count rate per unit energy."
     )
+
+
+# Leaves that scale, fold or reflect a component rather than being one.
+_NOT_COMPONENTS = (MatrixModel, Albedo, InverseSquareFluxScaling, Constant)
+
+
+def _mismatch_hint(model, x):
+    """
+    Which components don't add up when evaluating ``model`` on ``x`` fails
+    with incompatible units or shapes, and what to do; `None` if it isn't clear.
+    """
+    if not any(isinstance(leaf, MatrixModel) for leaf in leaf_models(model)):
+        return None
+    units = {}
+    for leaf in leaf_models(model):
+        if not isinstance(leaf, _NOT_COMPONENTS) and not getattr(leaf, "count_space", False):
+            try:
+                units[id(leaf)] = getattr(leaf(x), "unit", None)
+            except Exception:  # noqa: BLE001 - only looking for a hint
+                units[id(leaf)] = None
+
+    def name(leaf):
+        return leaf.name or type(leaf).__name__
+
+    # Added after the response, so must give counts.
+    after = [leaf for leaf in _added_after_response(model) if units.get(id(leaf)) is not None]
+    after = [leaf for leaf in after if not units[id(leaf)].is_equivalent(u.ct)]
+    if after:
+        listed = ", ".join(f"{name(leaf)} ({units[id(leaf)]})" for leaf in after)
+        return (
+            f"Added after the MatrixModel, {listed} must be in count space: give its normalisation in counts, "
+            "e.g. GaussianModel(amplitude=5 * u.ct / (u.s * u.keV), ...), or fold it through the response with "
+            "the rest of the photon model."
+        )
+
+    # Photon-space components added together in different units.
+    photon = [leaf for leaf in leaf_models(model) if units.get(id(leaf)) is not None]
+    if len({unit.physical_type for unit in (units[id(leaf)] for leaf in photon)}) > 1:
+        listed = ", ".join(f"{name(leaf)} {units[id(leaf)]}" for leaf in photon)
+        return (
+            f"The photon-space components are in different units: {listed}. ThermalEmission and ThickTarget "
+            "give the emission at the Sun (ph / (keV s)), which InverseSquareFluxScaling turns into a flux at "
+            "the observer (ph / (keV s cm2)). Give components added to them the same units, or add components "
+            "in flux units after the scaling, e.g. ((ThermalEmission() + ThickTarget()) * "
+            "InverseSquareFluxScaling() + line) | Albedo() | MatrixModel()."
+        )
+    return None
+
+
+def _added_after_response(model):
+    """Leaves added to (or subtracted from) a part of ``model`` that goes through a MatrixModel."""
+    if not isinstance(model, CompoundModel):
+        return []
+    found = []
+    if model.op in ("+", "-"):
+        through = [
+            any(isinstance(leaf, MatrixModel) for leaf in leaf_models(side)) for side in (model.left, model.right)
+        ]
+        if through[0] != through[1]:
+            found += leaf_models(model.right if through[0] else model.left)
+    return found + _added_after_response(model.left) + _added_after_response(model.right)
+
+
+def _check_count_space_placement(model):
+    """Raise if a component in count space (in counts) is folded through a MatrixModel: it already gives counts."""
+    if not isinstance(model, CompoundModel):
+        return
+    if model.op == "|" and any(isinstance(leaf, MatrixModel) for leaf in leaf_models(model.right)):
+        folded = [leaf for leaf in leaf_models(model.left) if getattr(leaf, "count_space", False)]
+        if folded:
+            name = folded[0].name or type(folded[0]).__name__
+            raise ValueError(
+                f"{name} is in counts, so in count space, but is folded through the MatrixModel, which takes a "
+                "photon flux. Add it after the response, (photon_model | MatrixModel()) + component, or give it "
+                "in photons to fold it through the response."
+            )
+    _check_count_space_placement(model.left)
+    _check_count_space_placement(model.right)
 
 
 def _is_single_range(value):

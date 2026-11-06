@@ -33,10 +33,9 @@ from matplotlib.ticker import LogLocator, MaxNLocator, NullFormatter, ScalarForm
 from matplotlib.transforms import blended_transform_factory, offset_copy
 
 import astropy.units as u
-from astropy.modeling import CompoundModel, Parameter
+from astropy.modeling import CompoundModel
 from astropy.time import Time
 
-from sunkit_spex.fitting.fitters import ModelList
 from sunkit_spex.models.instrument_response import MatrixModel
 from sunkit_spex.models.physical.albedo import Albedo
 from sunkit_spex.models.scaling import Constant, InverseSquareFluxScaling
@@ -67,7 +66,8 @@ _SPARE_COLOURS = ["C1", "C4", "C5", "C6", "C8", "C9", "C7"]
 TOTAL_COLOUR = "k"
 
 #: Names components are shown with, by model name. Models named by the user
-#: (``name=...``) are shown with that name.
+#: (``name=...``) are shown with that name; others in count space
+#: (normalisation in counts) get " (counts)" after theirs.
 DISPLAY_NAMES = {
     "ThermalEmission": "Thermal",
     "ContinuumEmission": "Thermal continuum",
@@ -77,6 +77,7 @@ DISPLAY_NAMES = {
     "Albedo": "Albedo",
     "InverseSquareFluxScaling": "Distance",
     "Constant": "Constant",
+    "GaussianModel": "Gaussian",
 }
 
 #: Display symbol and, where the model works in scaled units, the unit string
@@ -99,6 +100,9 @@ PARAMETER_LABELS = {
     "observer_distance": (r"D", None),
     "constant": (r"C", None),
     "conversion_factor": (r"c", None),
+    ("GaussianModel", "amplitude"): (r"A", None),
+    ("GaussianModel", "mean"): (r"E_{0}", None),
+    ("GaussianModel", "stddev"): (r"\sigma", None),
 }
 
 # Models that only scale or fold a component; they don't name it.
@@ -175,7 +179,10 @@ def _leaf_labels(model, names=None):
     base = []
     for leaf in leaves:
         name = leaf.name or type(leaf).__name__
-        base.append(names.get(name) or DISPLAY_NAMES.get(name, name))
+        label = names.get(name) or DISPLAY_NAMES.get(name, name)
+        if not leaf.name and getattr(leaf, "count_space", False):
+            label = f"{label} (counts)"
+        base.append(label)
     labels, seen = {}, {}
     for leaf, name in zip(leaves, base):
         if base.count(name) > 1:
@@ -314,10 +321,6 @@ def _component_styles(model, labels, colours, names):
 # ---------------------------------------------------------------------- #
 # Parameters
 # ---------------------------------------------------------------------- #
-def _free_parameters(model):
-    return [n for n in model.param_names if not model.fixed[n] and not model.tied[n]]
-
-
 def _uncertainties(model):
     stds = getattr(model, "stds", None)
     if stds is None:
@@ -582,7 +585,7 @@ def plot_fit(
     }
 
     spectra = fit_manager.fit_spectra
-    models = fit_manager.fitted_models if fitted else _with_ties_applied(fit_manager.prepared_models, fit_manager.names)
+    models = fit_manager.fitted_models if fitted else fit_manager._initial_models()
     n = len(spectra)
     labels = list(labels) if labels is not None else fit_manager.names
     datasets = []
@@ -595,7 +598,10 @@ def plot_fit(
         time = _time_text(fit_manager, fit_manager.spectra[i]) if show_time else None
         datasets.append(d | {"name": name, "index": i, "time": time})
     _mark_differences(datasets)
-    _share_degrees_of_freedom(datasets, models)
+    # The fit statistic comes from the FitManager, so the plot shows the numbers it gives.
+    statistic = fit_manager.fit_statistic(fitted=fitted)
+    for d, own in zip(datasets, statistic["spectra"]):
+        d.update(chi2=own["chi2"], n_bins=own["n_bins"], chi2_red=own["chi2_red"])
     combined = layout == "combined" and n > 1
     groups = [datasets] if layout == "combined" or n == 1 else [[d] for d in datasets]
     n_panels = len(groups)
@@ -629,7 +635,7 @@ def plot_fit(
             group_options = options | {"highlight": _resolve_highlight(highlight, group)}
             keys += _draw_group(ax, ax_res, group, group_options, xscale, combined=len(group) > 1)
 
-        overall = _chi2_summary(datasets, models)
+        overall = _chi2_summary(statistic)
         heading = title
         if n_panels > 1:
             _share_panels(fig, axes, datasets, rows, columns)
@@ -693,24 +699,17 @@ def plot_fit(
     return fig, axes
 
 
-def _chi2_summary(datasets, models):
-    """The (joint) reduced chi-squared: chi-squared over fitted bins minus free parameters."""
-    chi2 = sum(d["chi2"] for d in datasets)
-    dof = sum(d["n_bins"] for d in datasets) - sum(len(_free_parameters(m)) for m in models)
-    text = rf"$\chi^2_\mathrm{{red}}$ = {chi2 / dof:.2f}" if dof > 0 else rf"$\chi^2$ = {chi2:.1f}"
-    return f"Joint {text}" if len(datasets) > 1 else text
+def _chi2_summary(statistic):
+    """The (joint) reduced chi-squared, from `~sunkit_spex.fitting.fitter.FitManager.fit_statistic`."""
+    text = _chi2_value(statistic["chi2"], statistic["chi2_red"])
+    return f"Joint {text}" if len(statistic["spectra"]) > 1 else text
 
 
-def _share_degrees_of_freedom(datasets, models):
-    """
-    Each spectrum's degrees of freedom, ``dof``: its fitted bins less its share
-    of the free parameters, in proportion to its bins (shared parameters can't
-    be given to one spectrum). They add up to the joint degrees of freedom.
-    """
-    n_free = sum(len(_free_parameters(m)) for m in models)
-    n_bins = sum(d["n_bins"] for d in datasets)
-    for d in datasets:
-        d["dof"] = d["n_bins"] * (1 - n_free / n_bins) if n_bins else 0
+def _chi2_value(chi2, chi2_red):
+    """The reduced chi-squared as text, or the chi-squared without degrees of freedom; empty if undefined."""
+    if np.isfinite(chi2_red):
+        return rf"$\chi^2_\mathrm{{red}}$ = {chi2_red:.2f}"
+    return rf"$\chi^2$ = {chi2:.1f}" if np.isfinite(chi2) else ""
 
 
 def _time_above_right_title(ax, time):
@@ -777,28 +776,8 @@ def _mark_differences(datasets):
 
 
 def _chi2_text(d):
-    """One spectrum's reduced chi-squared (see `_share_degrees_of_freedom`)."""
-    if d["dof"] > 0:
-        return rf"$\chi^2_\mathrm{{red}}$ = {d['chi2'] / d['dof']:.2f}"
-    return rf"$\chi^2$ = {d['chi2']:.1f}"
-
-
-def _with_ties_applied(models, names):
-    """
-    Copies of the (initial) models with tied parameters set from what they are
-    tied to; the fitters only do this while fitting.
-    """
-    models = ModelList([copy.deepcopy(model) for model in models], names)
-    for model in models:
-        for name in model.param_names:
-            tie = model.tied[name]
-            if tie:
-                # Joint ties take the list of models; a single model's ties take the model.
-                value = tie(models if len(models) > 1 else model)
-                if isinstance(value, Parameter):
-                    value = value.value if value.unit is None else value.quantity
-                setattr(model, name, value)
-    return models
+    """One spectrum's reduced chi-squared (see `~sunkit_spex.fitting.fitter.FitManager.fit_statistic`)."""
+    return _chi2_value(d["chi2"], d["chi2_red"])
 
 
 def _resolve_highlight(highlight, group):
@@ -918,7 +897,6 @@ def _prepare_dataset(fit_manager, model, spectrum, y, options, fit_edges):
     else:
         with np.errstate(divide="ignore", invalid="ignore"):
             residuals = np.where(sigma.value > 0, ((counts - total) / sigma).to_value(""), np.nan)
-    good = np.isfinite(residuals) & (sigma is not None) & fitted
 
     return {
         "model": model,
@@ -938,8 +916,6 @@ def _prepare_dataset(fit_manager, model, spectrum, y, options, fit_edges):
         "ylabel": ylabel,
         "residuals": residuals,
         "has_sigma": sigma is not None,
-        "chi2": float(np.sum(residuals[good] ** 2)) if sigma is not None else 0.0,
-        "n_bins": int(good.sum()) if sigma is not None else int(fitted.sum()),
         "fitted": fitted,
         "fit_range": (low, high),
         "fit_text": f"{_format_energy(low)}\N{EN DASH}{_format_energy(high)} {edges.unit.to_string()}",
